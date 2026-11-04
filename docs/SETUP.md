@@ -24,7 +24,7 @@ sh "$Y" onboard
 ```
 
 On Windows: `py -3 "C:\path\to\yobiru\scripts\yobiru.py" onboard`. A non-default data home goes
-before the command: `sh "$Y" --home /workspace/.tailmsg onboard`.
+before the command: `sh "$Y" --home /workspace/yobiru-data onboard`.
 
 ## Who does what
 
@@ -60,6 +60,14 @@ authorizes task execution or wake-ups. Ordinary
 
 `doctor` names the state it finds: not installed, daemon not running, permission denied, logged out,
 stopped, waiting for device approval (a tailnet administrator approves it), or running.
+
+On a cloud computer that may be rebuilt, also review [Tailscale state and startup](GROK_BOT.md#preserve-tailscale-state-and-startup).
+Keeping binaries or a stable hostname is insufficient: inspect the daemon's actual `--statedir`, any
+separate `--state` backend and its startup definition. Preserve private identity state on storage the
+host confirms survives the relevant rebuild, and use a supported startup mechanism. Keep the existing
+Yobiru data home and every agent's webhook, session and permissions. Any state relocation needs a
+coordinated, authorized stop/backup/reconfigure/start with identity verification; the plugin does not
+do this automatically. `onboard` and `doctor` cannot certify persistence or recovery after a rebuild.
 
 ## 2. Peers and agent names
 

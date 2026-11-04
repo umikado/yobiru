@@ -73,6 +73,14 @@ def snapshot(path):
     return out
 
 
+def python_env(values):
+    """Keep isolated test settings and the selected Linux interpreter's loader path."""
+    env = dict(values)
+    if sys.platform.startswith("linux") and os.environ.get("LD_LIBRARY_PATH"):
+        env.setdefault("LD_LIBRARY_PATH", os.environ["LD_LIBRARY_PATH"])
+    return env
+
+
 class LinuxInstallerTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="yobiru-linux-")).resolve()
@@ -101,8 +109,10 @@ class LinuxInstallerTests(unittest.TestCase):
         os.chmod(str(self.home / "config.json"), 0o640)
         self.codex_home = self.user / "codex home"
         self.codex_home.mkdir()
-        self.socket_dir = self.codex_home / "run"
-        self.socket_dir.mkdir()
+        # macOS temp homes can exceed the Unix socket path limit once nested.
+        # Keep the socket short while retaining the long, spaced data/config paths.
+        self.socket_dir = Path(tempfile.mkdtemp(prefix="yobiru-sock-", dir="/tmp")).resolve()
+        self.addCleanup(shutil.rmtree, str(self.socket_dir), True)
         self.socket_path = self.socket_dir / "app.sock"
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(str(self.socket_path))
@@ -133,9 +143,9 @@ class LinuxInstallerTests(unittest.TestCase):
         (home or self.home).joinpath("config.json").write_text(json.dumps(config, indent=2))
 
     def run_installer(self, *args, env=None, home=None, path_dirs=None):
-        environment = {"HOME": str(self.user), "PATH": os.pathsep.join([str(self.fakes)] + (path_dirs or []) +
-                                                                       ["/usr/bin", "/bin"]),
-                       "LANG": "C.UTF-8"}
+        environment = python_env({"HOME": str(self.user), "PATH": os.pathsep.join([str(self.fakes)] + (path_dirs or []) +
+                                                                                   ["/usr/bin", "/bin"]),
+                                  "LANG": "C.UTF-8"})
         environment.update(env or {})
         cmd = [sys.executable, str(INSTALLER), "--tailmsg-home", str(home or self.home)] + list(args)
         return subprocess.run(cmd, env=environment, capture_output=True, text=True, timeout=60)
@@ -245,7 +255,7 @@ class LinuxInstallerTests(unittest.TestCase):
         empty.mkdir()
         result = subprocess.run([sys.executable, str(INSTALLER), "--tailmsg-home", str(self.home), "--thread-id",
                                  self.thread, "--codex-remote", self.remote, "--dry-run"],
-                                env={"HOME": str(self.user), "PATH": str(empty)}, capture_output=True, text=True)
+                                env=python_env({"HOME": str(self.user), "PATH": str(empty)}), capture_output=True, text=True)
         self.refused(result, "--codex-path")
         self.assertEqual(before, snapshot(self.user))
         self.assertEqual([], self.calls())
@@ -337,7 +347,7 @@ class LinuxInstallerTests(unittest.TestCase):
         self.clear_calls()
         upgrade = subprocess.run([sys.executable, str(source / "install_codex_bridge_linux.py"), "--tailmsg-home",
                                   str(self.home), "--thread-id", self.thread, "--codex-remote", self.remote],
-                                 env={"HOME": str(self.user), "PATH": str(self.fakes) + ":/usr/bin:/bin"},
+                                 env=python_env({"HOME": str(self.user), "PATH": str(self.fakes) + ":/usr/bin:/bin"}),
                                  capture_output=True, text=True)
         second = self.ok(upgrade)
         self.assertIn(["restart", SERVICE], self.calls())
@@ -361,6 +371,25 @@ class LinuxInstallerTests(unittest.TestCase):
         self.assertTrue(queue.exists() and inbox.exists())
         with contextlib.closing(sqlite3.connect(str(queue))) as db:
             self.assertEqual([("uncertain",)], db.execute("SELECT state FROM messages").fetchall())
+
+    def test_upgrade_installs_new_code_and_never_touches_queue_rows(self):
+        self.ok(self.install("--no-start"))
+        queue = self.home / "codex-bridge" / "bridge.sqlite3"
+        with contextlib.closing(sqlite3.connect(str(queue))) as db:
+            db.execute("""CREATE TABLE messages (id TEXT PRIMARY KEY, path TEXT NOT NULL, wake TEXT NOT NULL,
+                state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL,
+                received_at REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL, error TEXT,
+                thread_id TEXT NOT NULL, host_id TEXT NOT NULL)""")
+            for index, state in enumerate(("enqueued", "delivered", "uncertain", "sending", "skipped")):
+                db.execute("INSERT INTO messages VALUES (?,?,'now',?,1,0,0,0,0,NULL,?,'local')",
+                           ("message_%04d" % index, "/x/%d.json" % index, state, self.thread))
+            db.commit()
+        before = queue.read_bytes()
+        self.ok(self.install("--no-start"))
+        self.assertEqual(before, queue.read_bytes())       # the installer reads the queue, never migrates it
+        for name in ("codex_bridge.py", "codex_queue_client.py", "codex_resident.py"):
+            self.assertEqual((INSTALLER.parent / name).read_bytes(), (self.home / "codex-local" / name).read_bytes())
+        self.assertEqual([], self.calls())                 # files only: active after the service restarts
 
     def test_rollback_keeps_files_when_the_bridge_cannot_be_stopped(self):
         receipt = self.ok(self.install())
@@ -464,7 +493,7 @@ class LinuxInstallerTests(unittest.TestCase):
             f.write("\nnew template paragraph\n")
         with open(str(source / "codex_bridge.py"), "a") as f:
             f.write("# version two\n")
-        env = {"HOME": str(self.user), "PATH": str(self.fakes) + ":/usr/bin:/bin"}
+        env = python_env({"HOME": str(self.user), "PATH": str(self.fakes) + ":/usr/bin:/bin"})
         base = [sys.executable, str(source / "install_codex_bridge_linux.py"), "--tailmsg-home", str(self.home),
                 "--thread-id", self.thread, "--codex-remote", self.remote, "--no-start"]
         plan = self.ok(subprocess.run(base + ["--dry-run"], env=env, capture_output=True, text=True))

@@ -7,14 +7,15 @@ read-only, expiring, unguessable URL on its own tailnet address; the receiver pu
 them itself and verifies sha256. Auth = Tailscale identity (`tailscale whois`) +
 per-machine access policy. Python 3.8+ stdlib only. See SPEC.md.
 """
-import argparse, datetime as dt, hashlib, http.client, ipaddress, json, mimetypes, os
-import re, secrets, shutil, ssl, stat, subprocess, sys, threading, time, unicodedata, urllib.parse
+import argparse, datetime as dt, errno, hashlib, http.client, ipaddress, json, mimetypes, os
+import re, secrets, shlex, shutil, socket, sqlite3, ssl, stat, subprocess, sys, threading, time, unicodedata, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from pathlib import Path
 
 VERSION = 1                     # wire protocol version (unchanged)
 PRODUCT = "yobiru"
-PRODUCT_VERSION = "0.4.3"       # Yobiru release of this file; tools/build_plugin.py check keeps it in sync
+PRODUCT_VERSION = "0.7.21"  # Yobiru release of this file; tools/build_plugin.py check keeps it in sync
 DEFAULTS = {
     "port": 7766,
     "access_policy": "tailnet",    # authenticated Tailscale peers; use "allowlist" for opt-in restriction
@@ -46,10 +47,38 @@ WAKE_DEFAULT = "batch"
 TAILNET_NETS = [ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48")]
 ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}\Z")      # \Z, not $: "$" would also accept a trailing newline
 MSG_REF_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")  # a message id or a unique prefix of one (CLI input)
+INBOX_PREVIEW = 500                                 # characters of text per `inbox --json` row
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,64}\Z")
-ENV_KEYS = {"v", "id", "from", "to", "ts", "kind", "text", "reply_to", "fetch", "wake", "agent", "from_agent"}
+ENV_KEYS = {"v", "id", "from", "to", "ts", "kind", "text", "reply_to", "fetch", "wake", "agent", "from_agent", "request", "response"}
 AGENT_MAX = 64
 FETCH_KEYS = {"name", "url", "sha256", "size", "mime", "expires"}
+STABLE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}\Z")
+
+
+def stable_peer_id(stable_id):
+    """Case-preserving device identity in a canonical, case-insensitive wire spelling."""
+    if not isinstance(stable_id, str) or not STABLE_ID_RE.fullmatch(stable_id):
+        return None
+    return "node:" + stable_id.encode("ascii").hex()
+
+
+def peer_identity(ident):
+    return stable_peer_id(ident.get("stable_id")) or ident.get("node")
+
+
+def fresh_whois(ctx, ip):
+    # Pull grants and stored ownership must come from LocalAPI now. The 60-second cache of ordinary traffic is
+    # never read here: a lookup that started before the address was reassigned can refill it at any moment.
+    return ctx.whois_uncached(ip)
+
+
+def is_pull_request(env):
+    return isinstance(env.get("request"), dict) and env["request"].get("transport") == "pull"
+
+
+def sender_matches(env, ident):
+    expected = peer_identity(ident) if is_pull_request(env) else ident.get("node")
+    return bool(expected) and env.get("from", "").lower().rstrip(".") == expected
 
 
 # ---------------------------------------------------------------- helpers
@@ -87,6 +116,136 @@ def atomic_write(path, data):
     tmp = path.with_name(path.name + ".tmp-" + secrets.token_hex(4))
     tmp.write_bytes(data)
     os.replace(tmp, path)
+
+
+def write_private_json(path, obj):
+    """Durably replace `path` with JSON, owner-only (0600): exclusive temporary file, fsync, atomic rename,
+    then the directory where supported. The temporary file is removed on any failure."""
+    path = Path(path)
+    tmp = path.with_name(".%s.%d.%s.tmp" % (path.name, os.getpid(), secrets.token_hex(4)))
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write((json.dumps(obj, ensure_ascii=True, indent=2) + "\n").encode("ascii"))
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        if os.path.lexists(str(tmp)):
+            os.unlink(str(tmp))
+        raise
+    if os.name == "posix":
+        fsync_directory(path.parent)
+
+
+# A directory fsync that the filesystem does not support; every other error (EIO, ...) is a real failure.
+UNSUPPORTED_SYNC = {getattr(errno, name) for name in ("EINVAL", "ENOTSUP", "EOPNOTSUPP") if hasattr(errno, name)}
+# Only these mean another holder has the lock (flock: EWOULDBLOCK; msvcrt: EACCES or EDEADLOCK); any other
+# locking error is raised, never reported as busy.
+LOCK_CONTENTION = {getattr(errno, name) for name in (("EACCES", "EDEADLOCK") if os.name == "nt"
+                                                     else ("EWOULDBLOCK", "EAGAIN")) if hasattr(errno, name)}
+
+
+def fsync_directory(directory):
+    fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        if exc.errno not in UNSUPPORTED_SYNC:
+            raise
+    finally:
+        os.close(fd)
+
+
+class FileLock(object):
+    """Non-blocking, cross-process exclusive lock on a file in the data home: flock on POSIX, msvcrt on Windows.
+    The kernel releases it when the holder exits, so a crashed process never leaves it held. acquire() is False
+    only for real contention; any other error is raised so that it surfaces as a failure."""
+
+    def __init__(self, path):
+        self.path, self.fd = Path(path), None
+
+    def acquire(self):
+        fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                import fcntl
+            except ImportError:
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            if exc.errno in LOCK_CONTENTION:
+                return False
+            raise
+        self.fd = fd
+        return True
+
+    def release(self):
+        if self.fd is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(self.fd, 0, os.SEEK_SET)
+                msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        finally:
+            os.close(self.fd)        # closing also releases flock
+            self.fd = None
+
+
+def sync_directory(path):
+    """Best-effort directory sync (not supported by every platform/filesystem)."""
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
+
+
+def private_open(path, truncate=False):
+    """A new file only this user can read (0600) whatever the process umask, never following a link. Request
+    inputs and results can be private even when a custom data home is traversable by other users."""
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | (os.O_TRUNC if truncate else os.O_EXCL)
+    descriptor = os.open(str(path), flags, 0o600)
+    if truncate and hasattr(os, "fchmod"):
+        os.fchmod(descriptor, 0o600)                 # an earlier partial file keeps its mode otherwise
+    return os.fdopen(descriptor, "wb")
+
+
+def private_mkdir(path):
+    """Create a directory and any missing parents as 0700; existing directories keep their mode."""
+    path, missing = Path(path), []
+    while not path.exists():
+        missing.append(path)
+        path = path.parent
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+
+
+def durable_write(path, data):
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp-" + secrets.token_hex(8))
+    try:
+        with open(temporary, "xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 def is_tailnet_ip(ip):
     try:
@@ -186,7 +345,9 @@ def parse_access_policy(raw):
                 valid = not any(c.isspace() or unicodedata.category(c).startswith("C") for c in rule)
             if valid:
                 r = rule.lower()
-                if r.startswith("user:"):
+                if r.startswith("node:"):
+                    valid = re.fullmatch(r"node:(?:[0-9a-f]{2}){1,128}", r) is not None
+                elif r.startswith("user:"):
                     valid = bool(r[5:]) and not any(c in r[5:] for c in ":/*\\")
                 elif r.startswith("tag:"):
                     valid = re.fullmatch(r"tag:[a-z0-9][a-z0-9_-]*", r) is not None
@@ -205,13 +366,17 @@ def parse_access_policy(raw):
 def peer_matches(rule, ident):
     """Shared host/FQDN/tag/user rule matching for transport, dispatcher and wake caps."""
     r = str(rule).lower()
+    if r.startswith("node:"):
+        return r == peer_identity(ident)
     if r.startswith("tag:"):
         return r in [t.lower() for t in ident.get("tags", [])]
     if r.startswith("user:"):
         return bool(ident.get("user")) and r[5:] == ident["user"].lower()
     r = r.rstrip(".")
     node = ident.get("node", "").lower().rstrip(".")
-    return bool(r) and r in {node, node.split(".")[0], ident.get("host", "").lower().rstrip(".")}
+    dns = ident.get("dns_name", "").lower().rstrip(".")
+    return bool(r) and r in {node, node.split(".")[0], ident.get("host", "").lower().rstrip("."),
+                             dns, dns.split(".")[0]}
 
 
 def access_decision(raw, ident, recipient_token=False, self_discovery=False):
@@ -229,7 +394,7 @@ def access_decision(raw, ident, recipient_token=False, self_discovery=False):
     if not isinstance(ident, dict) or not isinstance(ident.get("node"), str) or not ident["node"].strip(".") or \
             any(c.isspace() or unicodedata.category(c).startswith("C") for c in ident["node"]):
         return False, "unknown_peer"
-    if any(not isinstance(ident.get(k, ""), str) for k in ("host", "user")) or \
+    if any(not isinstance(ident.get(k, ""), str) for k in ("host", "user", "dns_name")) or \
             not isinstance(ident.get("tags", []), list) or \
             any(not isinstance(t, str) for t in ident.get("tags", [])):
         return False, "unknown_peer"
@@ -278,6 +443,10 @@ def parse_config(raw):
     return cfg, out
 
 
+class TailscaleUnavailable(RuntimeError):
+    """The CLI timed out or could not connect to the local Tailscale daemon."""
+
+
 class Ctx:
     def __init__(self, home):
         self.home = Path(home).expanduser()
@@ -291,29 +460,34 @@ class Ctx:
             log("created default config", cfg_path, "(authenticated Tailscale peers may communicate)")
         self.cfg, self.agents = parse_config(json.loads(cfg_path.read_text(encoding="utf-8")))
         self._whois_cache = {}
-        self._now_hits = {}          # (sender node, agent) -> [epoch seconds of effective `now`]
+        self._now_hits = {}          # (peer identity, agent) -> [epoch seconds of effective `now`]
         self._wake_lock = threading.Lock()
+        self._inbox_lock = threading.Lock()
         self._name_cache = {}        # session id -> (expires epoch, native name lookup result)
         self._name_guard = threading.Lock()
         self._name_lookup = threading.Lock()   # one lookup subprocess at a time
+        self.maintenance = None                # set by `serve`: supervised maintenance workers
+        self.receiver_identity = None          # set by `serve`: pinned LocalAPI identity, never rebound live
 
     def native_name(self, binding):
         """Read-only native session name for a bound session, cached (bounded subprocess cost)."""
         return cached_native_name(self.home, binding, self._name_cache, self._name_guard, self._name_lookup)
 
     # -------- tailscale CLI (LocalAPI) --------
-    def ts(self, *args):
+    def ts(self, *args, timeout=15):
         cmd = list(self.cfg["tailscale_cmd"]) + list(args)
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except FileNotFoundError:
             raise RuntimeError("tailscale CLI not found: %r (set tailscale_cmd in config.json)" % cmd[0])
         except subprocess.TimeoutExpired:
-            raise RuntimeError("tailscale CLI timed out: %r" % cmd)
+            raise TailscaleUnavailable("tailscale CLI timed out: %r" % cmd)
         if p.returncode != 0:
             err = (p.stderr or p.stdout).strip()
-            if re.search(r"permission denied|access denied|operation not permitted", err, re.I):
+            if re.search(r"permission denied|access (?:is )?denied|operation not permitted", err, re.I):
                 err += ' (hint: set "tailscale_cmd": ["sudo","-n","tailscale"] in config.json)'
+            elif re.search(r"failed to connect to local (?:tailscaled|tailscale daemon)\b", err, re.I):
+                raise TailscaleUnavailable("%s: %s" % (" ".join(cmd), err))
             raise RuntimeError("%s: %s" % (" ".join(cmd), err))
         return p.stdout
 
@@ -321,28 +495,58 @@ class Ctx:
         return json.loads(self.ts("status", "--json"))
 
     def whois(self, ip):
+        """Ordinary traffic may reuse a lookup of this address for 60 seconds; pull grants use whois_uncached."""
         hit = self._whois_cache.get(ip)
         if hit and hit[0] > time.time():
             return hit[1]
+        ident = self.whois_uncached(ip)
+        if ident is not None:
+            self._whois_cache[ip] = (time.time() + 60, ident)
+        return ident
+
+    def whois_uncached(self, ip):
         try:
-            d = json.loads(self.ts("whois", "--json", ip))
+            # Keep a stalled identity lookup below the sender's five-second /info timeout.
+            d = json.loads(self.ts("whois", "--json", ip, timeout=3))
+        except TailscaleUnavailable:
+            log("whois temporarily unavailable for", ip)
+            raise
         except Exception as e:
             log("whois failed for", ip, e)
             return None
         node, up = d.get("Node") or {}, d.get("UserProfile") or {}
+        # Shared-out peers deliberately have no MagicDNS name. Trust only the LocalAPI's
+        # node identity bound to this exact source address, never ComputedName or a claim
+        # inside the HTTP envelope. StableID is case-sensitive; its wire spelling is hex.
+        stable_id = node.get("StableID")
+        address_matches = False
+        try:
+            source = ipaddress.ip_address(ip)
+            address_matches = any(source == ipaddress.ip_interface(a).ip and
+                                  ipaddress.ip_interface(a).network.num_addresses == 1
+                                  for a in node.get("Addresses", []))
+        except (ValueError, TypeError):
+            pass
+        stable_valid = (stable_peer_id(stable_id) is not None and address_matches and
+                        type(node.get("ID")) is int and node["ID"] > 0 and
+                        type(node.get("User")) is int and node["User"] > 0 and
+                        type(up.get("ID")) is int and up["ID"] == node["User"])
+        dns_name = (node.get("Name") or "").rstrip(".").lower()
         ident = {
             "ip": ip,
-            "node": (node.get("Name") or "").rstrip(".").lower(),
-            "host": ((node.get("Hostinfo") or {}).get("Hostname") or "").lower(),
+            "node": dns_name or (stable_peer_id(stable_id) if stable_valid else ""),
+            "host": (((node.get("Hostinfo") or {}).get("Hostname") or "").lower() if dns_name else ""),
             "tags": node.get("Tags") or [],
             "user": up.get("LoginName") or "",
         }
-        self._whois_cache[ip] = (time.time() + 60, ident)
+        if stable_valid:
+            ident.update(stable_id=stable_id, dns_name=dns_name)
         return ident
 
     def self_node(self):
         s = self.status()["Self"]
-        return {"node": s["DNSName"].rstrip(".").lower(), "ips": s.get("TailscaleIPs") or []}
+        return {"node": s["DNSName"].rstrip(".").lower(), "ips": s.get("TailscaleIPs") or [],
+                "stable_id": s.get("ID")}
 
     def resolve(self, peer):
         """'ubuntu' | 'ubuntu.tailXXXX.ts.net' | '100.x.y.z' -> (fqdn, ipv4)"""
@@ -438,7 +642,7 @@ class Ctx:
             t = time.time()
             limit = int(self.cfg.get("wake_rate") or 0)
             with self._wake_lock:
-                key = (ident["node"], agent)
+                key = (peer_identity(ident), agent)     # one budget per peer, whether it pushes or pulls
                 hits = [x for x in self._now_hits.get(key, []) if x > t - 3600]
                 if len(hits) >= limit:
                     eff = "batch"
@@ -500,6 +704,50 @@ def validate_env(env):
     rt = env.get("reply_to")
     if rt is not None and (not isinstance(rt, str) or not ID_RE.match(rt)):
         return "bad reply_to"
+    if any(not isinstance(env[k], str) or not env[k] for k in ("from", "to")):
+        return "bad from/to"
+    req, response = env.get("request"), env.get("response")
+    if "request" in env:
+        pull = is_pull_request(env)
+        allowed = {"timeout_seconds", "reply_port", "transport", "uploads"} if pull else {"timeout_seconds", "reply_port"}
+        if (not isinstance(req, dict) or set(req) - allowed or not {"timeout_seconds", "reply_port"} <= set(req) or
+                type(req.get("timeout_seconds")) is not int or not 1 <= req["timeout_seconds"] <= 604800 or
+                type(req.get("reply_port")) is not int or not 1 <= req["reply_port"] <= 65535 or
+                env.get("kind") != "request" or "response" in env or env.get("reply_to")):
+            return "bad request (timeout_seconds 1..604800 and reply_port 1..65535 required)"
+        try:
+            parse_iso(env["ts"]) + dt.timedelta(seconds=req["timeout_seconds"])
+        except (ValueError, OverflowError):
+            return "request deadline outside supported timestamp range"
+        if pull:
+            if not re.fullmatch(r"node:(?:[0-9a-f]{2}){1,128}", env["from"]) or env.get("fetch"):
+                return "pull requests require a stable node sender and uploaded attachments"
+            uploads = req.get("uploads", [])
+            if not isinstance(uploads, list) or len(uploads) > 100:
+                return "bad request uploads"
+            names, tokens = set(), set()
+            for item in uploads:
+                if (not isinstance(item, dict) or set(item) != {"token", "name", "sha256", "size", "mime"} or
+                        not isinstance(item["token"], str) or not TOKEN_RE.fullmatch(item["token"]) or
+                        not isinstance(item["name"], str) or item["name"] != safe_name(item["name"]) or
+                        not item["name"] or item["name"] in names or item["token"] in tokens or
+                        not isinstance(item["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) or
+                        type(item["size"]) is not int or item["size"] < 0 or
+                        not isinstance(item["mime"], str) or len(item["mime"]) > 128 or
+                        any(ord(c) < 32 or ord(c) == 127 for c in item["mime"])):
+                    return "bad request upload item"
+                names.add(item["name"])
+                tokens.add(item["token"])
+    if "response" in env:
+        if (not isinstance(response, dict) or set(response) != {"state", "seq"} or
+                response.get("state") not in REQUEST_STATES or type(response.get("seq")) is not int or
+                not 1 <= response["seq"] <= 9223372036854775807 or not env.get("reply_to") or env.get("wake") != "none"):
+            return "bad response"
+        expected = "request-result" if response["state"] in REQUEST_FINAL + ("timed_out",) else "request-receipt"
+        if env.get("kind") != expected:
+            return "response kind does not match state"
+    if env.get("kind") in ("request-receipt", "request-result") and response is None:
+        return "response metadata required"
     fl = env.get("fetch", [])
     if not isinstance(fl, list) or len(fl) > 100:
         return "bad fetch list"
@@ -514,7 +762,1715 @@ def validate_env(env):
     return None
 
 
+# ---------------------------------------------------------------- durable request lifecycle (optional protocol v1 extension)
+REQUEST_CAPABILITY = "request-lifecycle-v1"
+REQUEST_PULL_CAPABILITY = "request-pull-v1"
+REQUEST_STATES = ("received", "running", "completed", "failed", "rejected", "blocked", "timed_out")
+REQUEST_FINAL = ("completed", "failed", "rejected", "blocked")
+TASK_RESOLUTIONS = ("open", "resolved")
+TASK_ATTENTION = ("none", "needs_attention")
+AUTHORIZATION_ISSUER_KINDS = ("trusted_local_human", "trusted_coordinator", "trusted_local_entry")
+AUTHORIZATION_STATUSES = ("active", "revoked", "expired", "consumed")
+ATTEMPT_KINDS = ("external", "internal")
+ATTEMPT_STATES = ("pending", "received", "running", "completed", "failed", "rejected", "blocked", "timed_out",
+                  "cancel_requested", "cancelled")
+# Local lifecycle evidence for incoming requests (NULL = not known). received_at: durable receiver acceptance;
+# started_at / progress_at: first / latest `running` the owner reported (the only start evidence; a queued or
+# seen notification is not); final_at / final_response_id: the durable final result and its exact response.
+LIFECYCLE_COLUMNS = ("received_at", "started_at", "progress_at", "final_at", "final_response_id")
+
+
+class RequestConnection(sqlite3.Connection):
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
+def enable_wal(db, timeout=15.0):
+    """Switch to WAL. Changing the journal mode does not wait on SQLite's busy handler, so a second process opening
+    a ledger that is still in rollback mode at the same moment gets "database is locked" at once: retry instead."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
+def request_db(ctx):
+    directory = ctx.home / "requests"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    ledger_path = directory / "ledger.sqlite3"
+    if ledger_path.is_symlink():
+        raise ValueError("request ledger must not be a symlink")
+    db = sqlite3.connect(str(ledger_path), timeout=15, factory=RequestConnection)
+    try:
+        try:
+            os.chmod(str(ledger_path), 0o600)
+        except OSError:
+            pass
+        db.row_factory = sqlite3.Row
+        enable_wal(db)
+        db.execute("PRAGMA synchronous=FULL")
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS requests (
+                direction TEXT NOT NULL, id TEXT NOT NULL, peer TEXT NOT NULL, port INTEGER NOT NULL,
+                envelope TEXT NOT NULL, record TEXT, deadline TEXT NOT NULL, state TEXT NOT NULL,
+                seq INTEGER NOT NULL DEFAULT 0, latest TEXT, submission TEXT, timed_out_at TEXT,
+                PRIMARY KEY (direction,id));
+            CREATE TABLE IF NOT EXISTS response_outbox (
+                id TEXT PRIMARY KEY, request_id TEXT NOT NULL, peer TEXT NOT NULL, port INTEGER NOT NULL,
+                envelope TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt REAL NOT NULL DEFAULT 0, delivered_at TEXT, last_error TEXT);
+            CREATE TABLE IF NOT EXISTS response_events (
+                id TEXT PRIMARY KEY, request_id TEXT NOT NULL, envelope TEXT NOT NULL, received_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS pull_staging (
+                id TEXT PRIMARY KEY, peer TEXT NOT NULL, envelope TEXT NOT NULL, expires TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY, client_ref TEXT, resolution TEXT NOT NULL DEFAULT 'open',
+                attention TEXT NOT NULL DEFAULT 'none', new_result INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, resolved_at TEXT, resolved_by TEXT,
+                generation INTEGER NOT NULL DEFAULT 0, current_authorization_id TEXT,
+                current_attempt_id TEXT, owner_kind TEXT, owner_id TEXT);
+            CREATE UNIQUE INDEX IF NOT EXISTS tasks_client_ref_idx ON tasks(client_ref)
+                WHERE client_ref IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS task_requests (
+                task_id TEXT NOT NULL, direction TEXT NOT NULL, request_id TEXT NOT NULL,
+                client_ref TEXT, attempt_no INTEGER NOT NULL DEFAULT 1, fingerprint TEXT,
+                attempt_id TEXT,
+                PRIMARY KEY (direction, request_id));
+            CREATE INDEX IF NOT EXISTS task_requests_task_idx ON task_requests(task_id);
+            CREATE TABLE IF NOT EXISTS task_authorizations (
+                authorization_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+                issuer_kind TEXT NOT NULL, issuer_ref TEXT NOT NULL,
+                scope_json TEXT NOT NULL, scope_digest TEXT NOT NULL,
+                target_agent TEXT, target_host TEXT, generation INTEGER NOT NULL,
+                status TEXT NOT NULL, issued_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL, revoked_at TEXT, revoked_by TEXT,
+                task_revision_digest TEXT, proposed_revision_digest TEXT,
+                source_ref TEXT, source_digest TEXT);
+            CREATE INDEX IF NOT EXISTS task_authorizations_task_idx ON task_authorizations(task_id);
+            CREATE TABLE IF NOT EXISTS task_attempts (
+                attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+                authorization_id TEXT, generation INTEGER NOT NULL,
+                request_id TEXT, direction TEXT, kind TEXT NOT NULL,
+                operation_key TEXT, operation_digest TEXT,
+                attempt_no INTEGER NOT NULL, state TEXT NOT NULL,
+                state_version INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                started_at TEXT, final_at TEXT, result_text TEXT,
+                target_agent TEXT, target_host TEXT,
+                UNIQUE(task_id, attempt_no));
+            CREATE INDEX IF NOT EXISTS task_attempts_task_idx ON task_attempts(task_id, attempt_no);
+            CREATE INDEX IF NOT EXISTS task_attempts_operation_idx ON task_attempts(task_id, operation_key);
+            CREATE TABLE IF NOT EXISTS task_authorization_events (
+                event_id TEXT PRIMARY KEY, authorization_id TEXT NOT NULL,
+                task_id TEXT NOT NULL, event TEXT NOT NULL, generation INTEGER NOT NULL,
+                at TEXT NOT NULL, actor TEXT NOT NULL, detail_json TEXT);
+        """)
+        migrate_request_ledger(db)
+    except BaseException:
+        db.close()
+        raise
+    return db
+
+
+def table_columns(db, table):
+    return {row[1] for row in db.execute("PRAGMA table_info(%s)" % table)}
+
+
+def _ensure_task_authorization_schema(db):
+    """Install the additive authorization/attempt ledger and migrate old task links.
+
+    This is intentionally local-only.  Existing request rows are historical evidence and are assigned
+    generation zero; migration never manufactures an authorization or makes an old request executable.
+    """
+    started = False
+    if not db.in_transaction:
+        db.execute("BEGIN IMMEDIATE")
+        started = True
+    try:
+        task_cols = table_columns(db, "tasks")
+        for column, definition in (
+                ("current_authorization_id", "TEXT"), ("current_attempt_id", "TEXT"),
+                ("owner_kind", "TEXT"), ("owner_id", "TEXT")):
+            if column not in task_cols:
+                db.execute("ALTER TABLE tasks ADD COLUMN %s %s" % (column, definition))
+        request_cols = table_columns(db, "task_requests")
+        if "attempt_id" not in request_cols:
+            db.execute("ALTER TABLE task_requests ADD COLUMN attempt_id TEXT")
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS task_authorizations (
+                authorization_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+                issuer_kind TEXT NOT NULL, issuer_ref TEXT NOT NULL,
+                scope_json TEXT NOT NULL, scope_digest TEXT NOT NULL,
+                target_agent TEXT, target_host TEXT, generation INTEGER NOT NULL,
+                status TEXT NOT NULL, issued_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL, revoked_at TEXT, revoked_by TEXT,
+                task_revision_digest TEXT, proposed_revision_digest TEXT,
+                source_ref TEXT, source_digest TEXT);
+            CREATE INDEX IF NOT EXISTS task_authorizations_task_idx ON task_authorizations(task_id);
+            CREATE TABLE IF NOT EXISTS task_attempts (
+                attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
+                authorization_id TEXT, generation INTEGER NOT NULL,
+                request_id TEXT, direction TEXT, kind TEXT NOT NULL,
+                operation_key TEXT, operation_digest TEXT,
+                attempt_no INTEGER NOT NULL, state TEXT NOT NULL,
+                state_version INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                started_at TEXT, final_at TEXT, result_text TEXT,
+                target_agent TEXT, target_host TEXT,
+                UNIQUE(task_id, attempt_no));
+            CREATE INDEX IF NOT EXISTS task_attempts_task_idx ON task_attempts(task_id, attempt_no);
+            CREATE INDEX IF NOT EXISTS task_attempts_operation_idx ON task_attempts(task_id, operation_key);
+            CREATE TABLE IF NOT EXISTS task_authorization_events (
+                event_id TEXT PRIMARY KEY, authorization_id TEXT NOT NULL,
+                task_id TEXT NOT NULL, event TEXT NOT NULL, generation INTEGER NOT NULL,
+                at TEXT NOT NULL, actor TEXT NOT NULL, detail_json TEXT);
+            CREATE UNIQUE INDEX IF NOT EXISTS task_requests_attempt_no_idx ON task_requests(task_id, attempt_no);
+        """)
+        # Every protocol request is an external attempt.  Keep the old request row immutable and only add a
+        # mapping to the new append-only attempt table.  Legacy tasks deliberately stay at generation zero.
+        links = db.execute("SELECT tr.*, r.state, r.deadline, r.envelope, t.generation FROM task_requests tr "
+                           "JOIN tasks t ON t.task_id=tr.task_id "
+                           "LEFT JOIN requests r ON r.direction=tr.direction AND r.id=tr.request_id "
+                           "WHERE tr.attempt_id IS NULL ORDER BY tr.rowid").fetchall()
+        for link in links:
+            seed = "%s:%s:%s" % (link["direction"], link["request_id"], link["task_id"])
+            attempt_id = "attempt-legacy-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+            stamp = (_stamp(link["deadline"]) if link["deadline"] else None) or iso(now_utc())
+            state = link["state"] if link["state"] in ATTEMPT_STATES else "pending"
+            db.execute("INSERT OR IGNORE INTO task_attempts(attempt_id,task_id,authorization_id,generation,"
+                       "request_id,direction,kind,attempt_no,state,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                       (attempt_id, link["task_id"], None, link["generation"], link["request_id"],
+                        link["direction"], "external", link["attempt_no"], state, stamp))
+            db.execute("UPDATE task_requests SET attempt_id=? WHERE task_id=? AND direction=? AND request_id=?",
+                       (attempt_id, link["task_id"], link["direction"], link["request_id"]))
+        # A current attempt is only a projection pointer.  Choose the most recent linked attempt for migrated rows.
+        for task in db.execute("SELECT task_id FROM tasks WHERE current_attempt_id IS NULL").fetchall():
+            latest = db.execute("SELECT attempt_id FROM task_attempts WHERE task_id=? ORDER BY attempt_no DESC LIMIT 1",
+                                (task["task_id"],)).fetchone()
+            if latest:
+                db.execute("UPDATE tasks SET current_attempt_id=? WHERE task_id=?",
+                           (latest["attempt_id"], task["task_id"]))
+        if started:
+            db.commit()
+    except BaseException:
+        if started:
+            db.rollback()
+        raise
+
+
+def migrate_request_ledger(db):
+    """Add the lifecycle columns once (additive; older runtimes keep working on the same ledger).
+
+    Serialized like every writer, so a receiver and a CLI opening an old ledger together add each column once.
+    Backfill uses only evidence this receiver wrote itself: the stored receipt time, its own response envelopes
+    (timestamps of `running` and final responses) and the exact final response. Anything else stays NULL."""
+    # Task tables are deliberately separate from `requests`: old callers and recovery tools use positional
+    # inserts against old request schemas. Additive task tables preserve those ledgers while giving each attempt a
+    # durable task projection.
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id TEXT PRIMARY KEY, client_ref TEXT, resolution TEXT NOT NULL DEFAULT 'open',
+            attention TEXT NOT NULL DEFAULT 'none', new_result INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, resolved_at TEXT, resolved_by TEXT,
+            generation INTEGER NOT NULL DEFAULT 0);
+        CREATE UNIQUE INDEX IF NOT EXISTS tasks_client_ref_idx ON tasks(client_ref)
+            WHERE client_ref IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS task_requests (
+            task_id TEXT NOT NULL, direction TEXT NOT NULL, request_id TEXT NOT NULL,
+            client_ref TEXT, attempt_no INTEGER NOT NULL DEFAULT 1, fingerprint TEXT,
+            PRIMARY KEY (direction, request_id));
+        CREATE INDEX IF NOT EXISTS task_requests_task_idx ON task_requests(task_id);
+    """)
+    missing_lifecycle = [c for c in LIFECYCLE_COLUMNS if c not in table_columns(db, "requests")]
+    if missing_lifecycle:
+        db.execute("BEGIN IMMEDIATE")
+        # Re-read after acquiring the writer lock: another opener may have completed this additive migration while
+        # this connection was waiting, so never issue a duplicate ALTER TABLE.
+        missing = [c for c in LIFECYCLE_COLUMNS if c not in table_columns(db, "requests")]
+    else:
+        missing = []
+    if not missing and not db.in_transaction:
+        backfill_tasks(db)
+        _ensure_task_authorization_schema(db)
+        return
+    try:
+        for column in missing:
+            db.execute("ALTER TABLE requests ADD COLUMN %s TEXT" % column)
+        if missing:
+            backfill_lifecycle(db)
+        backfill_tasks(db)
+        _ensure_task_authorization_schema(db)
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+
+
+def _stamp(value):
+    """A receiver-written UTC timestamp, or None."""
+    try:
+        return iso(parse_iso(value)) if isinstance(value, str) else None
+    except ValueError:
+        return None
+
+
+def backfill_lifecycle(db):
+    responses = {}
+    for row in db.execute("SELECT request_id, envelope FROM response_outbox ORDER BY rowid"):
+        try:
+            env = json.loads(row["envelope"])
+            state, seq, ts = env["response"]["state"], env["response"]["seq"], _stamp(env["ts"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        if ts is not None and type(seq) is int:
+            responses.setdefault(row["request_id"], []).append((seq, state, ts))
+    for row in db.execute("SELECT id, record, state, latest FROM requests WHERE direction='incoming'").fetchall():
+        try:
+            received = _stamp(json.loads(row["record"])["received"]["at"])
+        except (ValueError, KeyError, TypeError):
+            received = None
+        # First and latest `running` in durable response order (seq), never by comparing wall-clock stamps:
+        # a clock step backwards must not make a later report look like the first start.
+        running = [ts for _, state, ts in sorted(responses.get(row["id"], [])) if state == "running"]
+        final_at = final_id = None
+        if row["state"] in REQUEST_FINAL and row["latest"]:
+            try:
+                latest = json.loads(row["latest"])
+                if latest["response"]["state"] == row["state"]:
+                    final_at, final_id = _stamp(latest["ts"]), latest["id"]
+            except (ValueError, KeyError, TypeError):
+                pass
+        db.execute("UPDATE requests SET received_at=COALESCE(received_at,?), started_at=COALESCE(started_at,?), "
+                   "progress_at=COALESCE(progress_at,?), final_at=COALESCE(final_at,?), "
+                   "final_response_id=COALESCE(final_response_id,?) WHERE direction='incoming' AND id=?",
+                   (received, running[0] if running else None, running[-1] if running else None,
+                    final_at, final_id, row["id"]))
+
+
+def task_fingerprint(env):
+    """Stable local content identity for an optional client_ref (wire IDs and timestamps are attempt-specific)."""
+    value = json.loads(json.dumps(env))
+    value.pop("id", None)
+    value.pop("ts", None)
+    return hashlib.sha256(json_canonical(value).encode("utf-8")).hexdigest()
+
+
+def task_id_for_request(direction, request_id):
+    return "task-%s-%s" % ("i" if direction == "incoming" else "o", request_id)
+
+
+def task_state_for_request(state):
+    if state == "completed":
+        return "resolved", "none", 1
+    if state in ("failed", "rejected", "blocked", "timed_out"):
+        return "open", "needs_attention", 1
+    return "open", "none", 0
+
+
+def _attempt_id(prefix="attempt"):
+    return "%s-%s" % (prefix, secrets.token_hex(12))
+
+
+def _attempt_state(state):
+    return state if state in ATTEMPT_STATES else "pending"
+
+
+def _set_task_current_attempt(db, task_id, attempt_id, generation, authorization_id=None, state="pending"):
+    """Move the task projection to a newly created attempt while holding the writer transaction."""
+    resolution, attention, _ = task_state_for_request(state)
+    stamp = iso(now_utc())
+    db.execute("UPDATE tasks SET resolution=?, attention=?, new_result=0, updated_at=?, resolved_at=NULL, "
+               "resolved_by=NULL, current_attempt_id=?, current_authorization_id=?, generation=? WHERE task_id=?",
+               (resolution, attention, stamp, attempt_id, authorization_id, generation, task_id))
+
+
+def _generation_error(db, task_id, message):
+    """Record stale control input as attention without changing the task generation."""
+    stamp = iso(now_utc())
+    db.execute("UPDATE tasks SET resolution='open', attention='needs_attention', updated_at=? WHERE task_id=?",
+               (stamp, task_id))
+    # The public operation raises after recording the attention state.  Commit this small, isolated control event
+    # before the surrounding context manager observes the exception and rolls back its transaction.
+    db.commit()
+    raise ValueError(message)
+
+
+def task_create_or_link(db, direction, request_id, env, state, client_ref=None):
+    """Create/link one attempt to a task while the caller's request transaction is held."""
+    fingerprint = task_fingerprint(env)
+    task = None
+    if client_ref:
+        task = db.execute("SELECT * FROM tasks WHERE client_ref=?", (client_ref,)).fetchone()
+        if task:
+            prior = db.execute("SELECT fingerprint FROM task_requests WHERE task_id=? LIMIT 1", (task["task_id"],)).fetchone()
+            if prior and prior["fingerprint"] and prior["fingerprint"] != fingerprint:
+                raise ValueError("client_ref already belongs to a different task")
+    if task is None:
+        task_id = task_id_for_request(direction, request_id) if not client_ref else "task-" + secrets.token_hex(12)
+        stamp = iso(now_utc())
+        resolution, attention, result = task_state_for_request(state)
+        db.execute("INSERT INTO tasks(task_id,client_ref,resolution,attention,new_result,created_at,updated_at) "
+                   "VALUES(?,?,?,?,?,?,?)", (task_id, client_ref, resolution, attention, result, stamp, stamp))
+        task = db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+    attempt = db.execute("SELECT COALESCE(MAX(attempt_no),0)+1 FROM task_attempts WHERE task_id=?",
+                         (task["task_id"],)).fetchone()[0]
+    attempt_id = _attempt_id("attempt")
+    generation = int(task["generation"])
+    db.execute("INSERT INTO task_attempts(attempt_id,task_id,generation,request_id,direction,kind,attempt_no,state,created_at) "
+               "VALUES(?,?,?,?,?,?,?,?,?)", (attempt_id, task["task_id"], generation, request_id, direction,
+                                                "external", attempt, _attempt_state(state), iso(now_utc())))
+    db.execute("INSERT INTO task_requests(task_id,direction,request_id,client_ref,attempt_no,fingerprint,attempt_id) "
+               "VALUES(?,?,?,?,?,?,?)", (task["task_id"], direction, request_id, client_ref, attempt, fingerprint,
+                                           attempt_id))
+    _set_task_current_attempt(db, task["task_id"], attempt_id, generation, None, state)
+    return task["task_id"]
+
+
+def task_sync(db, direction, request_id, state, stamp=None):
+    """Project an immutable request transition onto its long-lived task without reviving the request."""
+    link = db.execute("SELECT task_id,attempt_id,attempt_no FROM task_requests WHERE direction=? AND request_id=?",
+                      (direction, request_id)).fetchone()
+    if not link:
+        return
+    attempt_id = link["attempt_id"]
+    if not attempt_id:
+        # Old ledgers can be read during a rolling upgrade; do not create an attempt from a read-only event.
+        return
+    resolution, attention, result = task_state_for_request(state)
+    stamp = stamp or iso(now_utc())
+    attempt = db.execute("SELECT * FROM task_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+    if not attempt:
+        return
+    # The request row remains immutable, while its attempt receives the durable lifecycle event.
+    final = state in REQUEST_FINAL or state == "timed_out"
+    if attempt["state"] not in REQUEST_FINAL and attempt["state"] != "timed_out":
+        db.execute("UPDATE task_attempts SET state=?, state_version=state_version+1, "
+                   "started_at=CASE WHEN ?='running' THEN COALESCE(started_at,?) ELSE started_at END, "
+                   "final_at=CASE WHEN ? THEN COALESCE(final_at,?) ELSE final_at END WHERE attempt_id=?",
+                   (_attempt_state(state), state, stamp, final, stamp, attempt_id))
+    current = db.execute("SELECT current_attempt_id,generation FROM tasks WHERE task_id=?", (link["task_id"],)).fetchone()
+    # A late response/expiry from an older attempt is historical only. It may update that attempt row but can
+    # never overwrite the current task projection or reopen a newer generation.
+    if not current or current["current_attempt_id"] != attempt_id or int(attempt["generation"]) != int(current["generation"]):
+        return
+    db.execute("UPDATE tasks SET resolution=?, attention=?, new_result=MAX(new_result,?), updated_at=?, "
+               "resolved_at=CASE WHEN ?='resolved' THEN COALESCE(resolved_at,?) ELSE NULL END, "
+               "resolved_by=CASE WHEN ?='resolved' THEN resolved_by ELSE NULL END WHERE task_id=?",
+               (resolution, attention, result, stamp, resolution, stamp, resolution, link["task_id"]))
+
+
+def backfill_tasks(db):
+    """Populate one stable task projection per pre-task request row; never changes request state."""
+    rows = db.execute("SELECT * FROM requests ORDER BY rowid").fetchall()
+    for row in rows:
+        if db.execute("SELECT 1 FROM task_requests WHERE direction=? AND request_id=?", (row["direction"], row["id"])).fetchone():
+            continue
+        try:
+            env = json.loads(row["envelope"])
+            client_ref = None
+            created = _stamp(json.loads(row["record"])["received"].get("at")) if row["record"] else None
+            created = created or _stamp(env.get("ts")) or iso(now_utc())
+        except (ValueError, KeyError, TypeError):
+            env, client_ref, created = {"id": row["id"], "ts": row["deadline"]}, None, iso(now_utc())
+        task_id = task_id_for_request(row["direction"], row["id"])
+        resolution, attention, result = task_state_for_request(row["state"])
+        db.execute("INSERT OR IGNORE INTO tasks(task_id,client_ref,resolution,attention,new_result,created_at,updated_at) "
+                   "VALUES(?,?,?,?,?,?,?)", (task_id, client_ref, resolution, attention, result, created, created))
+        db.execute("INSERT OR IGNORE INTO task_requests(task_id,direction,request_id,client_ref,attempt_no,fingerprint) "
+                   "VALUES(?,?,?,?,1,?)", (task_id, row["direction"], row["id"], client_ref, task_fingerprint(env)))
+
+
+def task_projection(db, direction, request_id, row=None):
+    """Read-only task fields for a request, with deterministic derived values for an old ledger."""
+    row = row or request_row(db, direction, request_id)
+    if not row:
+        return None
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('tasks','task_requests','task_attempts')")}
+    if not {"tasks", "task_requests", "task_attempts"} <= tables:
+        resolution, attention, result = task_state_for_request(row["state"])
+        return {"task_id": task_id_for_request(direction, request_id), "client_ref": None,
+                "resolution": resolution, "attention": attention, "new_result": bool(result),
+                "generation": 0, "created_at": _stamp(row["deadline"]), "updated_at": _stamp(row["deadline"]),
+                "resolved_at": _stamp(row["deadline"]) if resolution == "resolved" else None, "resolved_by": None,
+                "attempt_no": 1}
+    joined = db.execute("SELECT t.*, tr.client_ref AS request_client_ref, tr.attempt_no, tr.attempt_id, "
+                        "ta.authorization_id, ta.generation AS attempt_generation, ta.state AS attempt_state "
+                        "FROM task_requests tr JOIN tasks t ON t.task_id=tr.task_id "
+                        "LEFT JOIN task_attempts ta ON ta.attempt_id=tr.attempt_id "
+                        "WHERE tr.direction=? AND tr.request_id=?",
+                        (direction, request_id)).fetchone()
+    if not joined:
+        resolution, attention, result = task_state_for_request(row["state"])
+        return {"task_id": task_id_for_request(direction, request_id), "client_ref": None,
+                "resolution": resolution, "attention": attention, "new_result": bool(result),
+                "generation": 0, "created_at": None, "updated_at": None, "resolved_at": None,
+                "resolved_by": None, "attempt_no": 1}
+    return {"task_id": joined["task_id"], "client_ref": joined["client_ref"] or joined["request_client_ref"],
+            "resolution": joined["resolution"], "attention": joined["attention"],
+            "new_result": bool(joined["new_result"]), "generation": joined["generation"],
+            "created_at": joined["created_at"], "updated_at": joined["updated_at"],
+            "resolved_at": joined["resolved_at"], "resolved_by": joined["resolved_by"],
+            "attempt_no": joined["attempt_no"], "attempt_id": joined["attempt_id"],
+            "authorization_id": joined["authorization_id"],
+            "attempt_generation": joined["attempt_generation"] if joined["attempt_generation"] is not None
+            else joined["generation"], "attempt_state": joined["attempt_state"]}
+
+
+def json_canonical(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+
+def request_snapshot(home, mid, direction="incoming"):
+    """Read-only bridge lookup, without creating a database or touching the network."""
+    path = Path(home) / "requests" / "ledger.sqlite3"
+    if not path.is_file():
+        return None
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        row = request_row(db, direction, mid)
+        return request_view(row, task_projection(db, direction, mid, row)) if row else None
+    finally:
+        db.close()
+
+
+def request_snapshots(home):
+    path = Path(home) / "requests" / "ledger.sqlite3"
+    if not path.is_file():
+        return []
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute("SELECT * FROM requests ORDER BY rowid DESC").fetchall()
+        return [request_view(row, task_projection(db, row["direction"], row["id"], row)) for row in rows]
+    finally:
+        db.close()
+
+
+def task_view(db, task_id, rows, task=None):
+    """One long-lived task projection assembled from its linked immutable attempts."""
+    rows = list(rows)
+    if not rows and task is None:
+        return None
+    rows.sort(key=lambda item: item["rowid"] if "rowid" in item.keys() else 0, reverse=True)
+    latest = rows[0] if rows else None
+    if task is None:
+        has_tasks = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone()
+        task = db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone() if has_tasks else None
+    if task:
+        client_ref = task["client_ref"]
+        resolution, attention, new_result = task["resolution"], task["attention"], bool(task["new_result"])
+        created_at, updated_at = task["created_at"], task["updated_at"]
+        resolved_at, resolved_by, generation = task["resolved_at"], task["resolved_by"], task["generation"]
+    else:
+        resolution, attention, new_result = task_state_for_request(latest["state"])
+        client_ref = None
+        created_at = updated_at = _stamp(latest["deadline"])
+        resolved_at = created_at if resolution == "resolved" else None
+        resolved_by, generation = None, 0
+    # `task_state_for_request` returns a tuple; normalize the derived result to the public boolean form.
+    if not task:
+        new_result = bool(new_result)
+    current_attempt = None
+    has_attempts = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_attempts'").fetchone())
+    current_attempt_id = task["current_attempt_id"] if task and "current_attempt_id" in task.keys() else None
+    if has_attempts and current_attempt_id:
+        current_attempt = db.execute("SELECT * FROM task_attempts WHERE attempt_id=?", (current_attempt_id,)).fetchone()
+    if current_attempt and current_attempt["request_id"]:
+        linked = db.execute("SELECT * FROM requests WHERE direction=? AND id=?",
+                            (current_attempt["direction"], current_attempt["request_id"])).fetchone()
+        if linked:
+            latest = linked
+    elif current_attempt and current_attempt["kind"] == "internal":
+        # An internal retry has no protocol request. Keep the old request queryable, but do not present its
+        # blocked/final response as the current attempt's result.
+        latest = None
+    latest_view = request_view(latest, task_projection(db, latest["direction"], latest["id"], latest)) if latest else None
+    current_state = current_attempt["state"] if current_attempt else (latest_view["state"] if latest_view else "pending")
+    current_auth = current_attempt["authorization_id"] if current_attempt else (
+        task["current_authorization_id"] if task and "current_authorization_id" in task.keys() else None)
+    has_auth = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_authorizations'").fetchone())
+    auth_row = (db.execute("SELECT status,expires_at FROM task_authorizations WHERE authorization_id=?",
+                           (current_auth,)).fetchone() if has_auth and current_auth else None)
+    latest_request_id = current_attempt["request_id"] if current_attempt and current_attempt["request_id"] else (latest["id"] if latest else None)
+    latest_direction = current_attempt["direction"] if current_attempt and current_attempt["direction"] else (latest["direction"] if latest else None)
+    latest_peer = latest_view["peer"] if latest_view else (current_attempt["target_host"] if current_attempt else None)
+    latest_agent = latest_view["agent"] if latest_view else current_attempt["target_agent"] if current_attempt else None
+    latest_from_agent = latest_view["from_agent"] if latest_view else None
+    latest_deadline = latest_view["deadline"] if latest_view else None
+    return {"task_id": task_id, "client_ref": client_ref, "resolution": resolution, "attention": attention,
+            "new_result": new_result, "generation": generation, "created_at": created_at,
+            "updated_at": updated_at, "resolved_at": resolved_at, "resolved_by": resolved_by,
+            "attempt_count": (db.execute("SELECT COUNT(*) FROM task_attempts WHERE task_id=?", (task_id,)).fetchone()[0]
+                              if has_attempts else len(rows)),
+            "latest_request_id": latest_request_id, "latest_direction": latest_direction,
+            "direction": latest_direction, "latest_attempt_id": current_attempt["attempt_id"] if current_attempt else None,
+            "authorization_id": current_auth, "latest_state": current_state, "peer": latest_peer,
+            "agent": latest_agent, "from_agent": latest_from_agent, "deadline": latest_deadline,
+            "authorization_status": auth_row["status"] if auth_row else None,
+            "authorization_expires_at": auth_row["expires_at"] if auth_row else None,
+            "response": latest_view.get("response") if latest_view else None}
+
+
+def task_snapshots(home, open_only=False):
+    """Read-only task list. Existing pre-task ledgers are projected without migrating or writing them."""
+    path = Path(home) / "requests" / "ledger.sqlite3"
+    if not path.is_file():
+        return []
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute("SELECT rowid,* FROM requests ORDER BY rowid DESC").fetchall()
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('tasks','task_requests')")}
+        groups = {}
+        task_rows = {}
+        has_task_tables = {"tasks", "task_requests"} <= tables
+        if has_task_tables:
+            for task in db.execute("SELECT * FROM tasks ORDER BY updated_at DESC, rowid DESC").fetchall():
+                task_rows[task["task_id"]] = task
+            links = db.execute("SELECT task_id,direction,request_id FROM task_requests ORDER BY rowid DESC").fetchall()
+            by_key = {(row["direction"], row["id"]): row for row in rows}
+            for link in links:
+                row = by_key.get((link["direction"], link["request_id"]))
+                if row:
+                    groups.setdefault(link["task_id"], []).append(row)
+            for task_id in task_rows:
+                groups.setdefault(task_id, [])
+        else:
+            for row in rows:
+                groups.setdefault(task_id_for_request(row["direction"], row["id"]), []).append(row)
+        output = []
+        for task_id, attempts in groups.items():
+            item = task_view(db, task_id, attempts, task_rows.get(task_id))
+            if item and (not open_only or item["resolution"] == "open"):
+                output.append(item)
+        output.sort(key=lambda item: (item.get("updated_at") or "", item["task_id"]), reverse=True)
+        return output
+    finally:
+        db.close()
+
+
+def _check_task_id(task_id):
+    if not isinstance(task_id, str) or not re.fullmatch(r"task-[A-Za-z0-9_-]{8,80}", task_id):
+        raise ValueError("bad task id")
+
+
+def _trusted_issuer(issuer_kind, issuer_ref):
+    if issuer_kind not in AUTHORIZATION_ISSUER_KINDS:
+        raise ValueError("untrusted authorization issuer")
+    if issuer_ref is None:
+        issuer_ref = {"trusted_local_human": "local-user", "trusted_coordinator": "local-coordinator",
+                      "trusted_local_entry": "local-entry"}[issuer_kind]
+    if not isinstance(issuer_ref, str) or not issuer_ref or len(issuer_ref) > 160:
+        raise ValueError("bad authorization issuer")
+    # A caller may name a stable human record, but cannot turn an arbitrary agent/from_agent into an issuer.
+    allowed = (issuer_ref in ("local-user", "local-coordinator", "local-entry") or
+               issuer_ref.startswith("human:") or issuer_ref.startswith("coordinator:"))
+    if not allowed:
+        raise ValueError("untrusted authorization issuer")
+    return issuer_ref
+
+
+def _scope_value(scope):
+    if isinstance(scope, str):
+        try:
+            scope = json.loads(scope)
+        except (TypeError, ValueError):
+            raise ValueError("scope must be valid JSON")
+    if not isinstance(scope, dict) or not scope:
+        raise ValueError("scope must be a non-empty JSON object")
+    if "actions" in scope and (not isinstance(scope["actions"], list) or
+                               not scope["actions"] or any(not isinstance(x, str) or not x for x in scope["actions"])):
+        raise ValueError("scope actions must be a non-empty string list")
+    # Keep the record explicit: a scope with no action is still valid for a task-specific operation, but
+    # arbitrary opaque strings and non-JSON objects are never treated as authorization.
+    canonical = json_canonical(scope)
+    return scope, canonical, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _authorization_expiry(expires_seconds=None, expires_at=None, now=None):
+    now = now or now_utc()
+    issued = iso(now)
+    if expires_at is not None:
+        try:
+            expiry = parse_iso(expires_at)
+        except (TypeError, ValueError):
+            raise ValueError("bad authorization expiry")
+    else:
+        if expires_seconds is None:
+            expires_seconds = 3600
+        if type(expires_seconds) not in (int, float) or expires_seconds <= 0 or expires_seconds > 7 * 24 * 3600:
+            raise ValueError("authorization expiry must be 1..604800 seconds")
+        expiry = now + dt.timedelta(seconds=expires_seconds)
+    if expiry <= now:
+        raise ValueError("authorization expiry must be in the future")
+    if expiry - now > dt.timedelta(days=7):
+        raise ValueError("authorization expiry exceeds the local limit")
+    return issued, iso(expiry)
+
+
+def _authorization_view(row):
+    if not row:
+        return None
+    return {"authorization_id": row["authorization_id"], "task_id": row["task_id"],
+            "issuer_kind": row["issuer_kind"], "issuer_ref": row["issuer_ref"],
+            "scope": json.loads(row["scope_json"]), "scope_digest": row["scope_digest"],
+            "target_agent": row["target_agent"], "target_host": row["target_host"],
+            "generation": row["generation"], "status": row["status"],
+            "issued_at": row["issued_at"], "expires_at": row["expires_at"],
+            "revoked_at": row["revoked_at"], "revoked_by": row["revoked_by"],
+            "task_revision_digest": row["task_revision_digest"],
+            "proposed_revision_digest": row["proposed_revision_digest"]}
+
+
+def authorization_snapshot(home, authorization_id):
+    path = Path(home) / "requests" / "ledger.sqlite3"
+    if not path.is_file():
+        return None
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        row = db.execute("SELECT * FROM task_authorizations WHERE authorization_id=?", (authorization_id,)).fetchone()
+        view = _authorization_view(row)
+        if view and view["status"] == "active" and parse_iso(view["expires_at"]) <= now_utc():
+            view["status"] = "expired"
+        return view
+    finally:
+        db.close()
+
+
+def attempt_snapshot(home, attempt_id):
+    path = Path(home) / "requests" / "ledger.sqlite3"
+    if not path.is_file():
+        return None
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
+    try:
+        row = db.execute("SELECT * FROM task_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        db.close()
+
+
+def authorize_task(ctx, task_id, scope, target_agent=None, target_host=None, expires_seconds=3600,
+                   expected_generation=None, issuer_kind="trusted_local_human", issuer_ref=None,
+                   expires_at=None, task_revision_digest=None, proposed_revision_digest=None,
+                   source_ref=None, source_digest=None, generation=None, issuer=None):
+    """Record a trusted local authorization and advance the task control generation atomically.
+
+    This function is deliberately separate from message receipt: no envelope field, from_agent or client_ref can
+    call it.  The caller must be the trusted local human/coordinator entry point.
+    """
+    _check_task_id(task_id)
+    if expected_generation is None and generation is not None:
+        expected_generation = generation
+    if issuer is not None and issuer_ref is None:
+        issuer_ref = issuer
+    issuer_ref = _trusted_issuer(issuer_kind, issuer_ref)
+    scope_obj, scope_json, scope_digest = _scope_value(scope)
+    issued_at, expiry = _authorization_expiry(expires_seconds, expires_at)
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        task = db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not task:
+            raise ValueError("no task with this ID")
+        current = int(task["generation"])
+        expected = current if expected_generation is None else expected_generation
+        if type(expected) is not int or expected != current:
+            _generation_error(db, task_id, "authorization generation mismatch")
+        generation = current + 1
+        authorization_id = _attempt_id("auth")
+        db.execute("INSERT INTO task_authorizations(authorization_id,task_id,issuer_kind,issuer_ref,scope_json,"
+                   "scope_digest,target_agent,target_host,generation,status,issued_at,expires_at,created_at,"
+                   "task_revision_digest,proposed_revision_digest,source_ref,source_digest) "
+                   "VALUES(?,?,?,?,?,?,?,?,?,'active',?,?,?,?,?,?,?)",
+                   (authorization_id, task_id, issuer_kind, issuer_ref, scope_json, scope_digest, target_agent,
+                    target_host, generation, issued_at, expiry, issued_at, task_revision_digest,
+                    proposed_revision_digest, source_ref, source_digest))
+        db.execute("UPDATE tasks SET generation=?, current_authorization_id=?, resolution='open', attention='none', "
+                   "updated_at=?, resolved_at=NULL, resolved_by=NULL WHERE task_id=? AND generation=?",
+                   (generation, authorization_id, issued_at, task_id, current))
+        if db.execute("SELECT changes()").fetchone()[0] != 1:
+            raise ValueError("authorization generation changed concurrently")
+        db.execute("INSERT INTO task_authorization_events(event_id,authorization_id,task_id,event,generation,at,actor,detail_json) "
+                   "VALUES(?,?,?,?,?,?,?,?)", (_attempt_id("event"), authorization_id, task_id, "issued", generation,
+                                                 issued_at, issuer_ref, json_canonical({"scope_digest": scope_digest})))
+        return _authorization_view(db.execute("SELECT * FROM task_authorizations WHERE authorization_id=?",
+                                              (authorization_id,)).fetchone())
+
+
+def revoke_task_authorization(ctx, authorization_id, expected_generation=None, revoked_by="local-user", generation=None):
+    if not isinstance(authorization_id, str) or not authorization_id.startswith("auth-"):
+        raise ValueError("bad authorization id")
+    if expected_generation is None and generation is not None:
+        expected_generation = generation
+    revoked_by = _trusted_issuer("trusted_local_human", revoked_by)
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        auth = db.execute("SELECT * FROM task_authorizations WHERE authorization_id=?", (authorization_id,)).fetchone()
+        if not auth:
+            raise ValueError("no authorization with this ID")
+        task = db.execute("SELECT * FROM tasks WHERE task_id=?", (auth["task_id"],)).fetchone()
+        expected = task["generation"] if expected_generation is None else expected_generation
+        if type(expected) is not int or expected != int(task["generation"]):
+            _generation_error(db, auth["task_id"], "authorization generation mismatch")
+        if auth["status"] in ("revoked", "expired"):
+            return _authorization_view(auth)
+        stamp = iso(now_utc())
+        db.execute("UPDATE task_authorizations SET status='revoked', revoked_at=?, revoked_by=? "
+                   "WHERE authorization_id=? AND status IN ('active','consumed')", (stamp, revoked_by, authorization_id))
+        db.execute("UPDATE tasks SET generation=?, current_authorization_id=NULL, attention='needs_attention', updated_at=? WHERE task_id=? AND generation=?",
+                   (int(task["generation"]) + 1, stamp, task["task_id"], int(task["generation"])))
+        if db.execute("SELECT changes()").fetchone()[0] != 1:
+            raise ValueError("authorization generation changed concurrently")
+        db.execute("INSERT INTO task_authorization_events(event_id,authorization_id,task_id,event,generation,at,actor) "
+                   "VALUES(?,?,?,?,?,?,?)", (_attempt_id("event"), authorization_id, auth["task_id"], "revoked",
+                                               int(task["generation"]) + 1, stamp, revoked_by))
+        return _authorization_view(db.execute("SELECT * FROM task_authorizations WHERE authorization_id=?",
+                                              (authorization_id,)).fetchone())
+
+
+def create_task_attempt(ctx, task_id, authorization_id, expected_generation=None, operation_key=None,
+                        operation_digest=None, action=None, target_agent=None, target_host=None, generation=None):
+    """Create an internal attempt for an already authorized task, with generation and operation CAS checks."""
+    _check_task_id(task_id)
+    if expected_generation is None and generation is not None:
+        expected_generation = generation
+    if not isinstance(authorization_id, str) or not authorization_id.startswith("auth-"):
+        raise ValueError("bad authorization id")
+    if operation_key is not None and (not isinstance(operation_key, str) or not operation_key or len(operation_key) > 200):
+        raise ValueError("bad operation key")
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        task = db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not task:
+            raise ValueError("no task with this ID")
+        generation = int(task["generation"])
+        expected = generation if expected_generation is None else expected_generation
+        if type(expected) is not int or expected != generation:
+            _generation_error(db, task_id, "attempt generation mismatch")
+        auth = db.execute("SELECT * FROM task_authorizations WHERE authorization_id=? AND task_id=?",
+                          (authorization_id, task_id)).fetchone()
+        if not auth:
+            raise ValueError("authorization does not belong to this task")
+        if int(auth["generation"]) != generation:
+            _generation_error(db, task_id, "authorization generation mismatch")
+        if operation_key:
+            prior = db.execute("SELECT * FROM task_attempts WHERE task_id=? AND operation_key=? ORDER BY attempt_no DESC LIMIT 1",
+                               (task_id, operation_key)).fetchone()
+            if prior:
+                if prior["operation_digest"] != operation_digest:
+                    raise ValueError("operation key belongs to a different attempt")
+                return {"task_id": task_id, "attempt_id": prior["attempt_id"], "authorization_id": prior["authorization_id"],
+                        "generation": prior["generation"], "attempt_no": prior["attempt_no"], "state": prior["state"],
+                        "idempotent": True}
+        if auth["status"] != "active":
+            raise ValueError("authorization is not active")
+        if parse_iso(auth["expires_at"]) <= now_utc():
+            stamp = iso(now_utc())
+            db.execute("UPDATE task_authorizations SET status='expired' WHERE authorization_id=? AND status='active'",
+                       (authorization_id,))
+            db.execute("UPDATE tasks SET attention='needs_attention', updated_at=? WHERE task_id=?", (stamp, task_id))
+            db.commit()
+            raise ValueError("authorization expired")
+        if action is not None:
+            actions = auth and json.loads(auth["scope_json"]).get("actions")
+            if isinstance(actions, list) and action not in actions and "*" not in actions:
+                raise ValueError("authorization scope does not cover action")
+        if auth["target_agent"] and target_agent and auth["target_agent"] != target_agent:
+            raise ValueError("attempt target agent does not match authorization")
+        if auth["target_host"] and target_host and auth["target_host"] != target_host:
+            raise ValueError("attempt target host does not match authorization")
+        attempt_no = db.execute("SELECT COALESCE(MAX(attempt_no),0)+1 FROM task_attempts WHERE task_id=?",
+                                (task_id,)).fetchone()[0]
+        attempt_id = _attempt_id("attempt")
+        stamp = iso(now_utc())
+        db.execute("INSERT INTO task_attempts(attempt_id,task_id,authorization_id,generation,kind,operation_key,"
+                   "operation_digest,attempt_no,state,created_at,target_agent,target_host) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (attempt_id, task_id, authorization_id, generation, "internal", operation_key, operation_digest,
+                    attempt_no, "pending", stamp, target_agent or auth["target_agent"], target_host or auth["target_host"]))
+        db.execute("UPDATE task_authorizations SET status='consumed' WHERE authorization_id=? AND status='active'",
+                   (authorization_id,))
+        db.execute("INSERT INTO task_authorization_events(event_id,authorization_id,task_id,event,generation,at,actor,detail_json) "
+                   "VALUES(?,?,?,?,?,?,?,?)", (_attempt_id("event"), authorization_id, task_id, "consumed", generation,
+                                                 stamp, "local-owner", json_canonical({"attempt_id": attempt_id})))
+        _set_task_current_attempt(db, task_id, attempt_id, generation, authorization_id, "pending")
+        return {"task_id": task_id, "attempt_id": attempt_id, "authorization_id": authorization_id,
+                "generation": generation, "attempt_no": attempt_no, "state": "pending", "idempotent": False}
+
+
+def authorize_and_create_task_attempt(ctx, task_id, scope, target_agent=None, target_host=None,
+                                      expires_seconds=3600, expected_generation=None, operation_key=None,
+                                      operation_digest=None, action=None, generation=None):
+    """Atomically issue a trusted authorization and create its first internal attempt."""
+    _check_task_id(task_id)
+    if expected_generation is None and generation is not None:
+        expected_generation = generation
+    issuer_kind, issuer_ref = "trusted_local_human", _trusted_issuer("trusted_local_human", None)
+    _, scope_json, scope_digest = _scope_value(scope)
+    issued_at, expiry = _authorization_expiry(expires_seconds)
+    if operation_key is not None and (not isinstance(operation_key, str) or not operation_key):
+        raise ValueError("bad operation key")
+    if action is not None:
+        actions = json.loads(scope_json).get("actions")
+        if isinstance(actions, list) and action not in actions and "*" not in actions:
+            raise ValueError("authorization scope does not cover action")
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        task = db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not task:
+            raise ValueError("no task with this ID")
+        current = int(task["generation"])
+        expected = current if expected_generation is None else expected_generation
+        if type(expected) is not int or expected != current:
+            _generation_error(db, task_id, "authorization generation mismatch")
+        if operation_key:
+            prior = db.execute("SELECT * FROM task_attempts WHERE task_id=? AND operation_key=? ORDER BY attempt_no DESC LIMIT 1",
+                               (task_id, operation_key)).fetchone()
+            if prior:
+                if prior["operation_digest"] != operation_digest:
+                    raise ValueError("operation key belongs to a different attempt")
+                return {"task_id": task_id, "attempt_id": prior["attempt_id"],
+                        "authorization_id": prior["authorization_id"], "generation": prior["generation"],
+                        "attempt_no": prior["attempt_no"], "state": prior["state"], "idempotent": True}
+        generation = current + 1
+        authorization_id = _attempt_id("auth")
+        db.execute("INSERT INTO task_authorizations(authorization_id,task_id,issuer_kind,issuer_ref,scope_json,"
+                   "scope_digest,target_agent,target_host,generation,status,issued_at,expires_at,created_at) "
+                   "VALUES(?,?,?,?,?,?,?,?,?,'active',?,?,?)",
+                   (authorization_id, task_id, issuer_kind, issuer_ref, scope_json, scope_digest, target_agent,
+                    target_host, generation, issued_at, expiry, issued_at))
+        attempt_no = db.execute("SELECT COALESCE(MAX(attempt_no),0)+1 FROM task_attempts WHERE task_id=?",
+                                (task_id,)).fetchone()[0]
+        attempt_id = _attempt_id("attempt")
+        db.execute("INSERT INTO task_attempts(attempt_id,task_id,authorization_id,generation,kind,operation_key,"
+                   "operation_digest,attempt_no,state,created_at,target_agent,target_host) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (attempt_id, task_id, authorization_id, generation, "internal", operation_key, operation_digest,
+                    attempt_no, "pending", issued_at, target_agent, target_host))
+        db.execute("UPDATE task_authorizations SET status='consumed' WHERE authorization_id=?", (authorization_id,))
+        db.execute("INSERT INTO task_authorization_events(event_id,authorization_id,task_id,event,generation,at,actor,detail_json) "
+                   "VALUES(?,?,?,?,?,?,?,?)", (_attempt_id("event"), authorization_id, task_id, "consumed", generation,
+                                                 issued_at, "local-owner", json_canonical({"attempt_id": attempt_id})))
+        db.execute("UPDATE tasks SET generation=?, current_authorization_id=?, current_attempt_id=?, resolution='open', "
+                   "attention='none', new_result=0, updated_at=?, resolved_at=NULL, resolved_by=NULL "
+                   "WHERE task_id=? AND generation=?", (generation, authorization_id, attempt_id, issued_at, task_id, current))
+        if db.execute("SELECT changes()").fetchone()[0] != 1:
+            raise ValueError("authorization generation changed concurrently")
+        db.execute("INSERT INTO task_authorization_events(event_id,authorization_id,task_id,event,generation,at,actor,detail_json) "
+                   "VALUES(?,?,?,?,?,?,?,?)", (_attempt_id("event"), authorization_id, task_id, "issued_and_attempted",
+                                                 generation, issued_at, issuer_ref, json_canonical({"attempt_id": attempt_id})))
+        return {"task_id": task_id, "attempt_id": attempt_id, "authorization_id": authorization_id,
+                "generation": generation, "attempt_no": attempt_no, "state": "pending", "idempotent": False}
+
+
+def transition_task_attempt(ctx, attempt_id, state, text=None, expected_generation=None, generation=None):
+    if not isinstance(attempt_id, str) or not attempt_id.startswith("attempt-"):
+        raise ValueError("bad attempt id")
+    if expected_generation is None and generation is not None:
+        expected_generation = generation
+    if state not in ATTEMPT_STATES or state == "received":
+        raise ValueError("invalid attempt state")
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        attempt = db.execute("SELECT * FROM task_attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        if not attempt:
+            raise ValueError("no attempt with this ID")
+        task = db.execute("SELECT * FROM tasks WHERE task_id=?", (attempt["task_id"],)).fetchone()
+        generation = int(task["generation"])
+        expected = generation if expected_generation is None else expected_generation
+        if type(expected) is not int or expected != generation or int(attempt["generation"]) != generation:
+            _generation_error(db, attempt["task_id"], "attempt generation mismatch")
+        if attempt["state"] in REQUEST_FINAL or attempt["state"] == "timed_out":
+            if attempt["state"] == state and (text is None or text == attempt["result_text"]):
+                return dict(attempt)
+            raise ValueError("attempt already has a durable final result")
+        stamp = iso(now_utc())
+        db.execute("UPDATE task_attempts SET state=?, state_version=state_version+1, result_text=?, "
+                   "started_at=CASE WHEN ?='running' THEN COALESCE(started_at,?) ELSE started_at END, "
+                   "final_at=CASE WHEN ? THEN COALESCE(final_at,?) ELSE final_at END WHERE attempt_id=?",
+                   (state, text, state, stamp, state in REQUEST_FINAL or state == "timed_out", stamp, attempt_id))
+        resolution, attention, result = task_state_for_request(state)
+        db.execute("UPDATE tasks SET resolution=?, attention=?, new_result=MAX(new_result,?), updated_at=?, "
+                   "resolved_at=CASE WHEN ?='resolved' THEN COALESCE(resolved_at,?) ELSE NULL END, "
+                   "resolved_by=CASE WHEN ?='resolved' THEN resolved_by ELSE NULL END "
+                   "WHERE task_id=? AND current_attempt_id=? AND generation=?",
+                   (resolution, attention, result, stamp, resolution, stamp, resolution, task["task_id"],
+                    attempt_id, generation))
+        return {"task_id": attempt["task_id"], "attempt_id": attempt_id, "generation": generation,
+                "state": state, "result_text": text, "resolution": resolution, "attention": attention}
+
+
+# Names used by integrations that describe the same local-only operations.
+task_authorize = authorize_task
+task_create_attempt = create_task_attempt
+task_attempt_transition = transition_task_attempt
+task_authorize_and_attempt = authorize_and_create_task_attempt
+task_authorization_create = authorize_task
+task_authorization_revoke = revoke_task_authorization
+task_attempt_create = create_task_attempt
+
+
+def resolve_task(ctx, task_id, by=None, note=None, expected_generation=None):
+    _check_task_id(task_id)
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        task = db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not task:
+            raise ValueError("no task with this ID")
+        if expected_generation is not None and (type(expected_generation) is not int or
+                                                 expected_generation != int(task["generation"])):
+            _generation_error(db, task_id, "task generation mismatch")
+        current_id = task["current_attempt_id"] if "current_attempt_id" in task.keys() else None
+        if current_id:
+            current = db.execute("SELECT state FROM task_attempts WHERE attempt_id=?", (current_id,)).fetchone()
+            if current and current["state"] in ("pending", "received", "running", "cancel_requested"):
+                raise ValueError("cannot resolve an active attempt")
+        stamp = iso(now_utc())
+        db.execute("UPDATE tasks SET resolution='resolved', attention='none', updated_at=?, resolved_at=?, resolved_by=? "
+                   "WHERE task_id=?", (stamp, stamp, by or "local-user", task_id))
+        item = {"task_id": task_id, "resolution": "resolved", "attention": "none", "resolved_at": stamp,
+                "resolved_by": by or "local-user"}
+        if note:
+            item["note"] = note[:500]
+        return item
+
+
+def task_backlog(db, now=None):
+    """Read-only task summary for health and bridge diagnostics; absence is explicit, never zero."""
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('tasks','task_requests')")}
+    if {"tasks", "task_requests"} <= tables:
+        row = db.execute("SELECT COUNT(*) AS total, SUM(resolution='open') AS open, "
+                         "SUM(resolution='open' AND attention='needs_attention') AS attention, "
+                         "SUM(resolution='resolved') AS resolved, SUM(new_result<>0) AS results FROM tasks").fetchone()
+        oldest = db.execute("SELECT MIN(updated_at) FROM tasks WHERE resolution='open' AND attention='needs_attention'").fetchone()[0]
+        return {"available": True, "total": row["total"], "open": row["open"] or 0,
+                "needs_attention": row["attention"] or 0, "resolved": row["resolved"] or 0,
+                "new_results": row["results"] or 0, "oldest_attention_at": oldest}
+    rows = db.execute("SELECT state FROM requests").fetchall()
+    open_count = attention = resolved = 0
+    for row in rows:
+        resolution, need, _ = task_state_for_request(row["state"])
+        open_count += resolution == "open"
+        attention += need == "needs_attention"
+        resolved += resolution == "resolved"
+    return {"available": True, "derived": True, "total": len(rows), "open": open_count,
+            "needs_attention": attention, "resolved": resolved, "new_results": resolved,
+            "oldest_attention_at": None}
+
+
+def request_record_response(home, mid, state, text):
+    """Bridge-only local persistence; no network, no configuration or execution permission changes."""
+    class LocalContext:
+        pass
+    ctx = LocalContext()
+    ctx.home = Path(home)
+    return respond_request(ctx, mid, state, text)
+
+
+def request_row(db, direction, mid):
+    return db.execute("SELECT * FROM requests WHERE direction=? AND id=?", (direction, mid)).fetchone()
+
+
+def queue_response(db, row, state, text, fetch=None, max_bytes=256 * 1024):
+    """Caller holds an IMMEDIATE transaction. Persist result and retry envelope together."""
+    original = json.loads(row["envelope"])
+    seq = row["seq"] + 1
+    local_node = json.loads(row["record"])["received"].get("node", original["to"])
+    env = {"v": VERSION, "id": secrets.token_hex(8), "from": local_node, "to": row["peer"],
+           "ts": iso(now_utc()), "kind": "request-result" if state in REQUEST_FINAL + ("timed_out",) else "request-receipt",
+           "text": text, "reply_to": original["id"], "wake": "none", "response": {"state": state, "seq": seq}}
+    if original.get("agent") is not None:
+        env["from_agent"] = original["agent"]
+    if original.get("from_agent") is not None:
+        env["agent"] = original["from_agent"]
+    if fetch:
+        env["fetch"] = fetch
+    error = validate_env(env)
+    packed = json_canonical(env)
+    if error or len(packed.encode("utf-8")) > max_bytes:
+        raise ValueError(error or "response exceeds max_msg_bytes; send large content as a file")
+    # Lifecycle evidence is written in the same transaction as the state and its outbox response, with the
+    # response's own timestamp. The first start is kept through timeout and finalization.
+    running, final = state == "running", state in REQUEST_FINAL
+    db.execute("UPDATE requests SET state=?,seq=?,latest=?,timed_out_at=COALESCE(timed_out_at,?),"
+               "started_at=COALESCE(started_at,?),progress_at=COALESCE(?,progress_at),"
+               "final_at=COALESCE(final_at,?),final_response_id=COALESCE(final_response_id,?) "
+               "WHERE direction='incoming' AND id=?",
+               (state, seq, packed, env["ts"] if state == "timed_out" else None,
+                env["ts"] if running else None, env["ts"] if running else None,
+                env["ts"] if final else None, env["id"] if final else None, row["id"]))
+    task_sync(db, "incoming", row["id"], state, env["ts"])
+    if not is_pull_request(original):
+        db.execute("INSERT INTO response_outbox(id,request_id,peer,port,envelope) VALUES(?,?,?,?,?)",
+                   (env["id"], row["id"], row["peer"], row["port"], packed))
+    return env
+
+
+def save_outgoing_request(ctx, env, peer, port, client_ref=None):
+    deadline = iso(parse_iso(env["ts"]) + dt.timedelta(seconds=env["request"]["timeout_seconds"]))
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("INSERT INTO requests(direction,id,peer,port,envelope,deadline,state,submission) "
+                   "VALUES('outgoing',?,?,?,?,?,'pending','prepared')",
+                   (env["id"], peer, port, json_canonical(env), deadline))
+        task_create_or_link(db, "outgoing", env["id"], env, "pending", client_ref)
+        if is_pull_request(env):
+            resolved, ip = ctx.resolve(peer)
+            ident = fresh_whois(ctx, ip)
+            key = stable_peer_id(ident.get("stable_id")) if ident else None
+            if resolved != peer or not key or not ctx.access_decision(ident)[0]:
+                raise ValueError("pull destination requires an authenticated stable node identity and local authorization")
+            db.execute("UPDATE requests SET record=? WHERE direction='outgoing' AND id=?",
+                       (json_canonical({"peer_identity": key}), env["id"]))
+
+
+def accept_request(ctx, rec):
+    """Durable receipt precedes HTTP 202. Duplicate ID must have the identical authenticated owner and envelope."""
+    env, peer = rec["envelope"], rec["received"]["peer"]["node"]
+    packed = json_canonical(env)
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = request_row(db, "incoming", env["id"])
+        if row:
+            if row["peer"] != peer or row["envelope"] != packed:
+                raise ValueError("request ID already belongs to a different sender or envelope")
+            return False
+        deadline = iso(parse_iso(env["ts"]) + dt.timedelta(seconds=env["request"]["timeout_seconds"]))
+        db.execute("INSERT INTO requests(direction,id,peer,port,envelope,record,deadline,state,received_at) "
+                   "VALUES('incoming',?,?,?,?,?,?,'pending',?)",
+                   (env["id"], peer, env["request"]["reply_port"], packed, json_canonical(rec), deadline,
+                    _stamp(rec["received"].get("at"))))
+        task_create_or_link(db, "incoming", env["id"], env, "pending")
+        queue_response(db, request_row(db, "incoming", env["id"]), "received", "Request durably received; execution has not been confirmed.")
+        if rec["received"].get("agent_status") == "unknown":
+            queue_response(db, request_row(db, "incoming", env["id"]), "rejected", "The addressed agent does not exist on this receiver.")
+        elif parse_iso(deadline) <= now_utc():
+            queue_response(db, request_row(db, "incoming", env["id"]), "timed_out", "Request deadline already passed on arrival; no execution was started.")
+    return True
+
+
+def accept_response(ctx, env, peer):
+    err = validate_env(env)
+    if err or "response" not in env:
+        raise ValueError(err or "missing response")
+    packed = json_canonical(env)
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = request_row(db, "outgoing", env["reply_to"])
+        if not row:
+            raise ValueError("response does not match an outgoing request")
+        original = json.loads(row["envelope"])
+        if (peer != row["peer"] or env["from"].lower().rstrip(".") != peer or
+                env["to"].lower().rstrip(".") != original["from"].lower().rstrip(".") or
+                env.get("from_agent") != original.get("agent") or env.get("agent") != original.get("from_agent")):
+            raise ValueError("response sender or agent does not match the original request")
+        previous = db.execute("SELECT envelope FROM response_events WHERE id=?", (env["id"],)).fetchone()
+        if previous:
+            if previous["envelope"] != packed:
+                raise ValueError("response ID conflicts with an earlier response")
+            return False
+        db.execute("INSERT INTO response_events VALUES(?,?,?,?)", (env["id"], env["reply_to"], packed, iso(now_utc())))
+        state, seq = env["response"]["state"], env["response"]["seq"]
+        # A delayed receipt must never replace a result. timed_out remains explicitly unknown and can
+        # be replaced by a later, real result. Real terminal results are immutable.
+        if row["state"] not in REQUEST_FINAL and seq > row["seq"] and not (
+                row["state"] == "timed_out" and state not in REQUEST_FINAL):
+            db.execute("UPDATE requests SET state=?,seq=?,latest=?,submission='accepted',"
+                       "timed_out_at=COALESCE(timed_out_at,?) WHERE direction='outgoing' AND id=?",
+                       (state, seq, packed, iso(now_utc()) if state == "timed_out" else None, row["id"]))
+            task_sync(db, "outgoing", row["id"], state, env["ts"])
+    return True
+
+
+def same_result_files(stored, fresh):
+    """Attachment identity for an identical retry. Each attempt stages its files under a new outbox token, so
+    names, sizes and SHA-256 are compared in order, never the tokened URLs."""
+    key = lambda items: [(i.get("name"), i.get("size"), i.get("sha256")) for i in items or []]  # noqa: E731
+    return key(stored) == key(fresh)
+
+
+def respond_request(ctx, mid, state, text, fetch=None):
+    if state not in ("running",) + REQUEST_FINAL:
+        raise ValueError("invalid response state")
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = request_row(db, "incoming", mid)
+        if not row:
+            raise ValueError("no tracked incoming request with this ID")
+        if row["state"] in REQUEST_FINAL:
+            previous = json.loads(row["latest"])
+            if row["state"] == state and previous["text"] == text and same_result_files(previous.get("fetch"), fetch):
+                return previous
+            raise ValueError("request already has a durable final result")
+        expired = parse_iso(row["deadline"]) <= now_utc()
+        if (row["state"] == "timed_out" or expired) and state == "running":
+            raise ValueError("request deadline passed; report an actual final outcome")
+        if expired and row["state"] != "timed_out":
+            queue_response(db, row, "timed_out", "Response deadline exceeded. Execution outcome is unknown; do not automatically repeat the task.")
+            row = request_row(db, "incoming", mid)
+        return queue_response(db, row, state, text, fetch, getattr(ctx, "cfg", {}).get("max_msg_bytes", 256 * 1024))
+
+
+def expire_requests(ctx):
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        rows = db.execute("SELECT * FROM requests WHERE direction='incoming' AND state IN ('received','running') AND deadline<=?",
+                          (iso(now_utc()),)).fetchall()
+        for row in rows:
+            queue_response(db, row, "timed_out", "Response deadline exceeded. Execution outcome is unknown; do not automatically repeat the task.")
+        overdue_outgoing = db.execute("SELECT id FROM requests WHERE direction='outgoing' "
+                                      "AND state NOT IN ('completed','failed','rejected','blocked') AND deadline<=?",
+                                      (iso(now_utc()),)).fetchall()
+        db.execute("UPDATE requests SET timed_out_at=COALESCE(timed_out_at,?) WHERE direction='outgoing' "
+                   "AND state NOT IN ('completed','failed','rejected','blocked') AND deadline<=?",
+                   (iso(now_utc()), iso(now_utc())))
+        for outgoing in overdue_outgoing:
+            task_sync(db, "outgoing", outgoing["id"], "timed_out")
+    return {"expired": len(rows)}
+
+
+def request_view(row, task=None):
+    env = json.loads(row["envelope"])
+    latest = json.loads(row["latest"]) if row["latest"] else None
+    known = row["state"] in REQUEST_FINAL
+    overdue = not known and parse_iso(row["deadline"]) <= now_utc()
+    view = {"id": row["id"], "direction": row["direction"], "peer": row["peer"],
+            "transport": env.get("request", {}).get("transport", "push"),
+            "agent": env.get("agent"), "from_agent": env.get("from_agent"), "port": row["port"],
+            "state": row["state"] if known or not overdue else "timed_out", "last_state": row["state"],
+            "deadline": row["deadline"], "overdue": overdue, "outcome_known": known,
+            "timed_out_at": row["timed_out_at"],
+            "late": bool(known and (row["timed_out_at"] or (latest and latest["ts"] > row["deadline"]))),
+            "seq": row["seq"], "submission": row["submission"], "response": latest}
+    view.update(lifecycle_fields(row))
+    if task:
+        view.update({"task_id": task["task_id"], "client_ref": task.get("client_ref"),
+                     "resolution": task["resolution"], "attention": task["attention"],
+                     "new_result": bool(task.get("new_result")), "task_generation": task.get("generation", 0),
+                     "attempt_no": task.get("attempt_no", 1), "attempt_id": task.get("attempt_id"),
+                     "authorization_id": task.get("authorization_id"),
+                     "attempt_generation": task.get("attempt_generation", task.get("generation", 0)),
+                     "attempt_state": task.get("attempt_state")})
+    else:
+        resolution, attention, result = task_state_for_request(row["state"])
+        view.update({"task_id": task_id_for_request(row["direction"], row["id"]), "client_ref": None,
+                     "resolution": resolution, "attention": attention, "new_result": bool(result),
+                     "task_generation": 0, "attempt_no": 1, "attempt_id": None,
+                     "authorization_id": None, "attempt_generation": 0, "attempt_state": row["state"]})
+    return view
+
+
+def lifecycle_fields(row):
+    """Additive, metadata-only lifecycle fields of one ledger row (older ledgers: unknown -> None).
+
+    `state` stays the computed view (an overdue request reads `timed_out` before maintenance persists it);
+    `timeout_persisted` says whether that timeout is durable. Only an owner-reported `running` (or a later
+    result after it) confirms a start: receipt, queueing or a seen notification never do."""
+    keys = row.keys()
+    get = lambda key: _stamp(row[key]) if key in keys else None      # an invalid stored time reads as unknown
+    started = get("started_at")
+    final_id = row["final_response_id"] if "final_response_id" in keys else None
+    return {"received_at": get("received_at"), "started_at": started, "progress_at": get("progress_at"),
+            "final_at": get("final_at"),
+            "final_response_id": final_id if isinstance(final_id, str) and ID_RE.match(final_id) else None,
+            "start_confirmed": started is not None or row["state"] == "running",
+            "timeout_persisted": bool(row["timed_out_at"])}
+
+
+def incoming_request_status(ctx, mid, peer):
+    snapshot = request_snapshot(ctx.home, mid)
+    return snapshot if snapshot and snapshot["peer"] == peer else None
+
+
+# ---------------------------------------------------------------- read-only lifecycle diagnostics
+LEDGER_READ_TIMEOUT = 2.0
+METADATA_MAX_IDS = 1000
+AGE_SCAN_LIMIT = 5000           # pending responses scanned for their oldest valid timestamp
+STAMP_GLOB = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z"
+ERROR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+
+
+def ledger_reader(home, timeout=LEDGER_READ_TIMEOUT):
+    """-> (read-only connection, None) or (None, fixed reason). Never creates the ledger or its directory.
+
+    mode=ro reads committed WAL data, so a running receiver's latest commits are seen. "Read-only" means no
+    application data, schema or configuration change; SQLite may still create its own -wal/-shm coordination
+    files next to a ledger whose writers have all closed. immutable=1 is deliberately not used: on a live WAL
+    database it can miss committed writes."""
+    path = Path(home) / "requests" / "ledger.sqlite3"
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None, "ledger_unreadable" if os.path.lexists(str(path)) else "ledger_absent"
+        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=timeout)
+    except (OSError, sqlite3.Error):
+        return None, "ledger_unreadable"
+    db.row_factory = sqlite3.Row
+    return db, None
+
+
+def ledger_error(exc):
+    text = str(exc).lower()
+    if "locked" in text or "busy" in text:
+        return "ledger_locked"
+    if "no such table" in text or "no such column" in text:
+        return "ledger_schema"
+    if "malformed" in text or "not a database" in text:
+        return "ledger_corrupt"
+    return "ledger_unreadable"
+
+
+def _age(stamp, now):
+    try:
+        return max(0, int((now - parse_iso(stamp)).total_seconds())) if stamp else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _epoch_stamp(value):
+    try:
+        return iso(dt.datetime.fromtimestamp(float(value), dt.timezone.utc).replace(microsecond=0))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def lifecycle_metadata(row, now):
+    """Metadata of one incoming ledger row: states, deadline and lifecycle times, never text or attachments."""
+    known = row["state"] in REQUEST_FINAL
+    overdue = not known and parse_iso(row["deadline"]) <= now
+    meta = {"state": row["state"] if known or not overdue else "timed_out", "last_state": row["state"],
+            "deadline": row["deadline"], "overdue": overdue, "outcome_known": known, "seq": row["seq"],
+            "final_persisted": known, "final_response_delivery": None, "final_response_attempts": None,
+            "final_response_next_attempt": None, "final_response_error": None,
+            "lifecycle_columns": "started_at" in row.keys()}
+    meta.update(lifecycle_fields(row))
+    if known and not meta["final_response_id"] and "latest" in row.keys() and row["latest"]:
+        try:                                      # a ledger from before final_response_id: exact latest result
+            latest = json.loads(row["latest"])
+            meta["final_response_id"] = latest["id"] if latest["response"]["state"] == row["state"] else None
+        except (ValueError, KeyError, TypeError):
+            pass
+    if not known:
+        meta["final_response_id"] = None
+    return meta
+
+
+def request_metadata(home, ids, now=None):
+    """Lifecycle metadata of incoming requests for status and diagnostics.
+
+    Read-only and metadata-only: one mode=ro read transaction covers the requests and the delivery rows of their
+    exact final responses (never an earlier receipt), so a concurrent final result is not half-seen. No message
+    text, attachment, envelope or peer is returned; no application data is created, migrated, expired or sent
+    (SQLite may manage its WAL coordination files, see ledger_reader).
+    -> ({id: metadata}, None), or ({}, fixed reason) when the ledger cannot be read."""
+    wanted = sorted({i for i in ids if isinstance(i, str) and ID_RE.match(i)})[:METADATA_MAX_IDS]
+    db, reason = ledger_reader(home)
+    if db is None:
+        return {}, reason
+    now = now or now_utc()
+    out = {}
+    try:
+        db.execute("BEGIN")
+        columns = table_columns(db, "requests")
+        # `latest` is read (never returned) so that a final result written by an older runtime, whose lifecycle
+        # columns are NULL or absent, still yields its exact final response ID; nothing else is inferred.
+        select = ["id", "state", "deadline", "seq", "timed_out_at", "latest"] + \
+            [c for c in LIFECYCLE_COLUMNS if c in columns]
+        for start in range(0, len(wanted), 200):
+            chunk = wanted[start:start + 200]
+            for row in db.execute("SELECT %s FROM requests WHERE direction='incoming' AND id IN (%s)"
+                                  % (",".join(select), ",".join("?" * len(chunk))), chunk).fetchall():
+                try:
+                    out[row["id"]] = lifecycle_metadata(row, now)
+                    task = task_projection(db, "incoming", row["id"])
+                    out[row["id"]].update({"task_id": task["task_id"], "resolution": task["resolution"],
+                                            "attention": task["attention"], "new_result": task["new_result"],
+                                            "client_ref": task.get("client_ref")})
+                except (TypeError, ValueError):
+                    continue                     # malformed row: reported as unavailable by the caller
+        finals = {}
+        for mid, meta in out.items():
+            if meta["final_response_id"]:
+                meta["final_response_delivery"] = "unknown"   # no matching outbox row: never assumed delivered
+                finals.setdefault(meta["final_response_id"], {})[mid] = meta
+        keys = sorted(finals)
+        for start in range(0, len(keys), 200):
+            chunk = keys[start:start + 200]
+            for row in db.execute("SELECT id,request_id,attempts,next_attempt,delivered_at,last_error FROM "
+                                  "response_outbox WHERE id IN (%s)" % ",".join("?" * len(chunk)), chunk).fetchall():
+                meta = finals[row["id"]].get(row["request_id"])
+                if meta is None:
+                    continue                      # an inconsistent row never confirms another request's result
+                meta["final_response_delivery"] = "confirmed" if row["delivered_at"] else "pending"
+                meta["final_response_attempts"] = row["attempts"]
+                meta["final_response_next_attempt"] = None if row["delivered_at"] else _epoch_stamp(row["next_attempt"])
+                error = row["last_error"]
+                meta["final_response_error"] = error if error is None or ERROR_NAME_RE.match(str(error)) else "other"
+        db.rollback()
+    except sqlite3.Error as exc:
+        return {}, ledger_error(exc)
+    finally:
+        db.close()
+    return out, None
+
+
+def request_backlog(home, now=None):
+    """Read-only, metadata-only ledger summary for health, doctor and status: counts and ages in one read
+    transaction with bounded queries. A ledger that cannot be read is reported with a fixed reason, never as an
+    empty backlog. Never creates, migrates, expires, repairs or sends (SQLite may manage its WAL coordination
+    files, see ledger_reader)."""
+    db, reason = ledger_reader(home)
+    if db is None:
+        return {"available": False, "reason": reason}
+    now = now or now_utc()
+    stamp, epoch = iso(now), now.timestamp()
+    final = "('completed','failed','rejected','blocked')"
+    try:
+        db.execute("BEGIN")
+        columns = table_columns(db, "requests")
+        lifecycle = set(LIFECYCLE_COLUMNS) <= columns
+        one = lambda sql, *args: db.execute(sql, args).fetchone()[0]
+        incoming = {
+            "unstarted": one("SELECT COUNT(*) FROM requests WHERE direction='incoming' AND state='received' "
+                             "AND deadline>?", stamp),
+            "running": one("SELECT COUNT(*) FROM requests WHERE direction='incoming' AND state='running' "
+                           "AND deadline>?", stamp),
+            "overdue_not_persisted": one("SELECT COUNT(*) FROM requests WHERE direction='incoming' "
+                                         "AND state IN ('received','running') AND deadline<=?", stamp),
+            "timed_out": one("SELECT COUNT(*) FROM requests WHERE direction='incoming' AND state='timed_out'"),
+            "final": one("SELECT COUNT(*) FROM requests WHERE direction='incoming' AND state IN %s" % final),
+            "lifecycle_columns": lifecycle}
+        if lifecycle:              # only well-formed stored times take part in the minimum
+            incoming["oldest_unstarted_age_seconds"] = _age(one(
+                "SELECT MIN(received_at) FROM requests WHERE direction='incoming' AND state='received' "
+                "AND deadline>? AND received_at GLOB ?", stamp, STAMP_GLOB), now)
+            incoming["oldest_progress_age_seconds"] = _age(one(
+                "SELECT MIN(CASE WHEN progress_at GLOB ? THEN progress_at WHEN started_at GLOB ? THEN started_at "
+                "END) FROM requests WHERE direction='incoming' AND state='running' AND deadline>?",
+                STAMP_GLOB, STAMP_GLOB, stamp), now)
+            # The exact final response of the same request: an earlier receipt never counts, nor another
+            # request's row. A final result without its outbox row is unknown, never delivered.
+            incoming["final_response_pending"] = one(
+                "SELECT COUNT(*) FROM requests r JOIN response_outbox o ON o.id=r.final_response_id "
+                "AND o.request_id=r.id WHERE r.direction='incoming' AND r.state IN %s "
+                "AND o.delivered_at IS NULL" % final)
+            incoming["final_response_unknown"] = one(
+                "SELECT COUNT(*) FROM requests r LEFT JOIN response_outbox o ON o.id=r.final_response_id "
+                "AND o.request_id=r.id WHERE r.direction='incoming' AND r.state IN %s AND o.id IS NULL" % final)
+        responses = {
+            "pending": one("SELECT COUNT(*) FROM response_outbox WHERE delivered_at IS NULL"),
+            "due": one("SELECT COUNT(*) FROM response_outbox WHERE delivered_at IS NULL AND next_attempt<=?", epoch),
+            "never_attempted": one("SELECT COUNT(*) FROM response_outbox WHERE delivered_at IS NULL AND attempts=0"),
+            "max_attempts": one("SELECT COALESCE(MAX(attempts),0) FROM response_outbox WHERE delivered_at IS NULL"),
+            "errors": {}}
+        # Oldest by each response's own valid timestamp, not by insertion order (a clock can step back, a row
+        # can be malformed). Due and never attempted is the only sign that delivery itself is not running.
+        oldest, unattempted, unreadable = None, None, 0
+        rows = db.execute("SELECT envelope, attempts, next_attempt FROM response_outbox WHERE delivered_at IS NULL "
+                          "LIMIT ?", (AGE_SCAN_LIMIT + 1,)).fetchall()
+        for row in rows[:AGE_SCAN_LIMIT]:
+            try:
+                created = parse_iso(json.loads(row["envelope"])["ts"])
+            except (ValueError, KeyError, TypeError):
+                unreadable += 1
+                continue
+            oldest = created if oldest is None else min(oldest, created)
+            if row["attempts"] == 0 and row["next_attempt"] <= epoch:
+                unattempted = created if unattempted is None else min(unattempted, created)
+        responses.update(
+            oldest_pending_age_seconds=None if oldest is None else max(0, int((now - oldest).total_seconds())),
+            oldest_unattempted_due_age_seconds=None if unattempted is None else
+            max(0, int((now - unattempted).total_seconds())),
+            unreadable_timestamps=unreadable, age_scan_truncated=len(rows) > AGE_SCAN_LIMIT)
+        for error, count in db.execute("SELECT last_error, COUNT(*) FROM response_outbox WHERE delivered_at IS NULL "
+                                       "AND last_error IS NOT NULL GROUP BY last_error LIMIT 32").fetchall():
+            key = error if ERROR_NAME_RE.match(str(error)) else "other"
+            responses["errors"][key] = responses["errors"].get(key, 0) + count
+        outgoing = {
+            "awaiting_result": one("SELECT COUNT(*) FROM requests WHERE direction='outgoing' AND state NOT IN %s"
+                                   % final),
+            "submission_unknown": one("SELECT COUNT(*) FROM requests WHERE direction='outgoing' "
+                                      "AND submission='unknown' AND state NOT IN %s" % final),
+            "overdue": one("SELECT COUNT(*) FROM requests WHERE direction='outgoing' AND state NOT IN %s "
+                           "AND deadline<=?" % final, stamp)}
+        tasks = task_backlog(db, now)
+        db.rollback()
+    except sqlite3.Error as exc:
+        return {"available": False, "reason": ledger_error(exc)}
+    finally:
+        db.close()
+    return {"available": True, "checked_at": stamp, "incoming": incoming, "responses": responses,
+            "outgoing": outgoing, "tasks": tasks}
+
+
+def prepare_pull_request(ctx, env, ident):
+    """Reserve an immutable owner/request/manifest before any file is accepted or agent is woken."""
+    error = validate_env(env)
+    if error or not is_pull_request(env) or not sender_matches(env, ident):
+        raise ValueError(error or "pull request sender does not match authenticated node")
+    uploads = env["request"].get("uploads", [])
+    if sum(item["size"] for item in uploads) > ctx.cfg["max_fetch_bytes"]:
+        raise ValueError("request uploads exceed max_fetch_bytes")
+    deadline = iso(parse_iso(env["ts"]) + dt.timedelta(seconds=env["request"]["timeout_seconds"]))
+    packed, peer = json_canonical(env), peer_identity(ident)
+    with request_db(ctx) as db:
+        db.execute("BEGIN IMMEDIATE")
+        existing = request_row(db, "incoming", env["id"])
+        staged = db.execute("SELECT * FROM pull_staging WHERE id=?", (env["id"],)).fetchone()
+        for row in (existing, staged):
+            if row and (row["peer"] != peer or row["envelope"] != packed):
+                raise ValueError("request ID already belongs to a different sender or envelope")
+        if existing:
+            return False
+        if parse_iso(deadline) <= now_utc():
+            raise ValueError("request upload deadline has passed")
+        if staged:
+            return False
+        db.execute("INSERT INTO pull_staging VALUES(?,?,?,?)", (env["id"], peer, packed, deadline))
+    return True
+
+
+def pull_upload_manifest(ctx, mid, peer, token=None):
+    with request_db(ctx) as db:
+        row = db.execute("SELECT * FROM pull_staging WHERE id=? AND peer=?", (mid, peer)).fetchone()
+        if not row:
+            return None
+        env = json.loads(row["envelope"])
+        if token is None:
+            return env
+        # No mutation of request inputs is possible after the request was committed.
+        if request_row(db, "incoming", mid) or parse_iso(row["expires"]) <= now_utc():
+            return None
+        return next((item for item in env["request"].get("uploads", []) if item["token"] == token), None)
+
+
+def materialize_pull_uploads(ctx, env, ident):
+    """Verify durable uploads and stage local inbox files before acknowledging request acceptance."""
+    staged = pull_upload_manifest(ctx, env["id"], peer_identity(ident))
+    if staged != env:
+        raise ValueError("prepare the identical pull request before committing it")
+    uploads = env["request"].get("uploads", [])
+    if not uploads:
+        return
+    directory = ctx.inbox / env["id"] / "files"
+    private_mkdir(directory)                       # the hard links share the uploads' 0600 inodes
+    for item in uploads:
+        source = ctx.home / "requests" / "uploads" / env["id"] / item["token"]
+        if (not source.is_file() or source.is_symlink() or source.stat().st_size != item["size"] or
+                sha256_file(source) != item["sha256"]):
+            raise ValueError("request upload is missing or incomplete: " + item["name"])
+        destination = directory / item["name"]
+        if destination.exists():
+            if destination.is_symlink() or destination.stat().st_size != item["size"] or sha256_file(destination) != item["sha256"]:
+                raise ValueError("local request attachment conflicts with its immutable manifest")
+        else:
+            os.link(str(source), str(destination))
+    sync_directory(directory)
+
+
+def recover_request_inbox(ctx):
+    """Recover inbox files lost between SQLite commit and materialization; never replay agent execution."""
+    with request_db(ctx) as db:
+        rows = db.execute("SELECT id,record FROM requests WHERE direction='incoming'").fetchall()
+    restored = 0
+    for row in rows:
+        path = ctx.inbox / (row["id"] + ".json")
+        if not path.exists():
+            # Never overwrite an ack/wake update if another process materialized the inbox meanwhile.
+            temporary = path.with_name(path.name + ".recover-" + secrets.token_hex(4))
+            try:
+                temporary.write_bytes(row["record"].encode("utf-8"))
+                try:
+                    os.link(str(temporary), str(path))
+                    restored += 1
+                except FileExistsError:
+                    pass
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+    return {"restored": restored}
+
+
+BUSY = "busy"                    # a phase found its work already running elsewhere and did nothing
+FLUSH_LIMIT = 20                 # due responses considered per pass
+FLUSH_BUDGET = 120               # seconds; no new delivery starts after this, the rest waits for the next pass
+FLUSH_EXCHANGE_SECONDS = 10      # wall-clock limit of one POST after connecting (a socket timeout is per read)
+FLUSH_REPLY_BYTES = 64 * 1024
+
+
+def flush_responses(ctx, limit=FLUSH_LIMIT, budget=FLUSH_BUDGET, clock=time.monotonic):
+    """Retry only immutable protocol responses. Unknown HTTP outcomes reuse the same response ID.
+
+    One flush per data home at a time, across processes (the receiver's worker and `request maintain`): another
+    caller gets BUSY and sends nothing. Destinations take turns: each pass visits the least recently attempted
+    routes first, tries each route's next due response, continues on that route only while deliveries succeed,
+    and leaves it after one failure, so an offline peer's backlog never starves another peer. Work is bounded:
+    at most `limit` attempts, none started after `budget` seconds, and a hard deadline per exchange. A delivery
+    failure is recorded on its row (backoff, error type only) and is not a maintenance failure. A ledger error
+    after a possible POST propagates: the row stays pending with the same ID, so the peer deduplicates it."""
+    (ctx.home / "requests").mkdir(mode=0o700, exist_ok=True)
+    lock = FileLock(ctx.home / "requests" / "flush.lock")
+    if not lock.acquire():
+        return BUSY
+    try:
+        now = time.time()
+        with request_db(ctx) as db:
+            due = db.execute("SELECT COUNT(*) FROM response_outbox WHERE delivered_at IS NULL AND next_attempt<=?",
+                             (now,)).fetchone()[0]
+            routes = db.execute("SELECT peer, port FROM response_outbox WHERE delivered_at IS NULL GROUP BY peer, port "
+                                "HAVING MIN(next_attempt)<=? ORDER BY MAX(next_attempt), MIN(rowid) LIMIT ?",
+                                (now, limit)).fetchall()
+        started, attempts, resolved = clock(), 0, {}
+        counts = {"due": due, "delivered": 0, "failed": 0}
+        for route in routes:
+            if attempts >= limit or clock() - started >= budget:
+                break
+            with request_db(ctx) as db:
+                rows = db.execute("SELECT * FROM response_outbox WHERE delivered_at IS NULL AND next_attempt<=? "
+                                  "AND peer=? AND port=? ORDER BY next_attempt, rowid LIMIT ?",
+                                  (now, route["peer"], route["port"], limit - attempts)).fetchall()
+            for row in rows:
+                if attempts >= limit or clock() - started >= budget:
+                    break
+                attempts += 1
+                error = deliver_response(ctx, row, resolved)
+                with request_db(ctx) as db:
+                    db.execute("UPDATE response_outbox SET attempts=attempts+1,next_attempt=?,delivered_at=?,last_error=? WHERE id=? AND delivered_at IS NULL",
+                               (time.time() + min(60, 2 ** min(row["attempts"] + 1, 6)),
+                                iso(now_utc()) if error is None else None, error, row["id"]))
+                counts["failed" if error else "delivered"] += 1
+                if error:
+                    break                         # one failed attempt per destination per pass
+        counts["deferred"] = due - counts["delivered"] - counts["failed"]   # untouched, still due next pass
+        return counts
+    finally:
+        lock.release()
+
+
+def deliver_response(ctx, row, resolved):
+    """POST one stored response to its original authenticated destination -> None, or the error type name."""
+    try:
+        guard = getattr(ctx, "receiver_identity", None)
+        if guard is not None and guard.changed:
+            return "receiver_identity_changed"
+        if row["peer"] not in resolved:
+            resolved[row["peer"]] = ctx.resolve(row["peer"])
+        peer, ip = resolved[row["peer"]]
+        if peer != row["peer"]:
+            raise RuntimeError("response destination identity changed")
+        ident = ctx.whois(ip)
+        if not ident or ident.get("node") != row["peer"] or not ctx.access_decision(ident)[0]:
+            raise RuntimeError("response destination denied by local access policy")
+        identity_error = receiver_identity_error(ctx)
+        if identity_error:
+            return identity_error
+        status, body = http_json(ip, row["port"], "POST", "/msg", json.loads(row["envelope"]), host=peer,
+                                 timeout=3, deadline=FLUSH_EXCHANGE_SECONDS, limit=FLUSH_REPLY_BYTES)
+        if status not in (200, 202) or not isinstance(body, dict) or body.get("ok") is not True or body.get("id") != row["id"]:
+            raise RuntimeError("response delivery not confirmed (HTTP %s)" % status)
+    except Exception as exc:
+        return type(exc).__name__     # avoid storing URLs, message contents or arbitrary remote error bodies
+    return None
+
+
+class PhaseIncomplete(Exception):
+    """A maintenance phase finished its bounded pass but some items failed; `code` is a fixed reason."""
+
+    def __init__(self, code, counts=None):
+        super().__init__(code)
+        self.code, self.counts = code, counts or {}
+
+
+REQUEST_PHASES = (("recover", lambda ctx: recover_request_inbox(ctx)), ("expire", lambda ctx: expire_requests(ctx)),
+                  ("flush", lambda ctx: flush_responses(ctx)))
+
+
+def run_phase(fn, ctx):
+    """-> ("ok" | "busy" | "failed", counts, fixed error code or None). Errors are recorded by type name only."""
+    try:
+        identity_error = receiver_identity_error(ctx)
+        if identity_error:
+            raise PhaseIncomplete(identity_error)
+        result = fn(ctx)
+    except PhaseIncomplete as exc:
+        return "failed", exc.counts, exc.code
+    except Exception as exc:
+        return "failed", {}, type(exc).__name__
+    if result == BUSY:
+        return "busy", {}, None
+    return "ok", result if isinstance(result, dict) else {}, None
+
+
+def request_maintenance(ctx):
+    """One pass of inbox recovery, request expiry and response delivery. Each phase is attempted even when an
+    earlier one fails, so a recovery error cannot stop expiry or delivery. -> {phase: outcome, ...}."""
+    results = {}
+    for name, fn in REQUEST_PHASES:
+        outcome, counts, error = run_phase(fn, ctx)
+        results[name] = outcome if error is None else "failed:" + error
+    return results
+
+
 # ---------------------------------------------------------------- server
+class ReceiverIdentity(object):
+    """Pin this process to its startup Tailscale identity; never rebind old work on rename/relogin.
+
+    Each check asks trusted LocalAPI with a one-second subprocess timeout. The bounded lock serializes
+    checks, so a slower old answer cannot overwrite a newer change. Unavailable state may recover;
+    a confirmed change latches until the operator restarts the receiver with its preserved data home.
+    """
+    def __init__(self, ctx, initial):
+        self.ctx, self.initial = ctx, self.key(initial)
+        self.lock = threading.Lock()
+        self.changed = False
+        self.generation, self.last_error = 0, "receiver_identity_unavailable"
+
+    @staticmethod
+    def key(node):
+        name, stable, ips = node.get("node"), node.get("stable_id"), node.get("ips")
+        if not isinstance(name, str) or not name or not stable_peer_id(stable) or not isinstance(ips, list) or not ips:
+            raise ValueError("receiver needs a Tailscale DNS name, StableID and addresses; check Tailscale login")
+        return name.rstrip(".").lower(), stable, tuple(sorted(str(ipaddress.ip_address(ip)) for ip in ips))
+
+    def check(self):
+        # Concurrent callers may share a check completed after they arrived. A caller arriving
+        # after completion always performs a new lookup: there is no cached authorization TTL.
+        observed = self.generation
+        if not self.lock.acquire(timeout=1.25):
+            return "receiver_identity_unavailable"
+        try:
+            if self.changed:
+                return "receiver_identity_changed"
+            if self.generation != observed:
+                return self.last_error
+            error = "receiver_identity_unavailable"
+            try:
+                status = json.loads(self.ctx.ts("status", "--json", timeout=1))
+                if status.get("BackendState") == "Running":
+                    own = status["Self"]
+                    current = self.key({"node": own.get("DNSName"), "stable_id": own.get("ID"),
+                                        "ips": own.get("TailscaleIPs")})
+                    self.changed = current != self.initial
+                    error = "receiver_identity_changed" if self.changed else None
+            except Exception:
+                pass
+            self.last_error = error
+            self.generation += 1
+            return error
+        finally:
+            self.lock.release()
+
+
+def receiver_identity_error(ctx):
+    guard = getattr(ctx, "receiver_identity", None)
+    return guard.check() if guard is not None else None
+
+
 def make_handler(ctx, me):
     cfg = ctx.cfg
 
@@ -525,22 +2481,49 @@ def make_handler(ctx, me):
         def log_message(self, fmt, *a):
             log(self.client_address[0], fmt % a)
 
-        def reply(self, code, obj):
+        def reply(self, code, obj, headers=None):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
-        def identify(self):
+        def check_receiver_identity(self):
+            error = receiver_identity_error(ctx)
+            if error:
+                # Refuse before consuming a message body or applying any stored grant. A client may
+                # retry an unavailable lookup with the same ID; changed identity needs operator recovery.
+                self.close_connection = True
+                detail = ("receiver identity changed; restart the existing receiver and reconcile original request IDs"
+                          if error == "receiver_identity_changed" else "receiver identity lookup unavailable")
+                self.reply(503, {"ok": False, "error": detail, "code": error}, {"Retry-After": "1"})
+                return False
+            return True
+
+        def identify(self, fresh=False):
             ip = self.client_address[0]
             if not is_tailnet_ip(ip):
                 self.reply(403, {"ok": False, "error": "not a tailnet address"})
                 return None
-            ident = ctx.whois(ip)
+            # A confirmed change stays locked, without spending another peer lookup. Otherwise
+            # refresh self identity after the potentially slow peer lookup, before metadata/effects.
+            guard = getattr(ctx, "receiver_identity", None)
+            if guard is not None and guard.changed:
+                self.check_receiver_identity()
+                return None
+            try:
+                ident = fresh_whois(ctx, ip) if fresh else ctx.whois(ip)
+            except TailscaleUnavailable:
+                self.reply(503, {"ok": False, "error": "identity lookup unavailable",
+                                 "code": "identity_unavailable"}, {"Retry-After": "1"})
+                return None
             if not isinstance(ident, dict) or not ident.get("node"):
                 self.reply(403, {"ok": False, "error": "unknown tailnet peer"})
+                return None
+            if not self.check_receiver_identity():
                 return None
             return ident
 
@@ -558,7 +2541,9 @@ def make_handler(ctx, me):
             if path == "/health":
                 if not is_tailnet_ip(self.client_address[0]):
                     return self.reply(403, {"ok": False, "error": "not a tailnet address"})
-                return self.reply(200, {"ok": True, "v": VERSION, "node": me})
+                # 200 whenever the receiver answers (transport reachability); `ok`/`status` carry maintenance
+                # readiness, so a degraded receiver is reachable but not reported healthy.
+                return self.reply(200, health_payload(ctx, me))
             if path == "/info":
                 # Authenticated discovery: Tailscale identity AND current policy (or this machine itself)
                 # are checked before any metadata is read or any session name is looked up.
@@ -573,6 +2558,14 @@ def make_handler(ctx, me):
                     log("info failed:", type(e).__name__)
                     return self.reply(500, {"ok": False, "error": "info unavailable"})
                 return self.reply(200, body)
+            if path.startswith("/requests/"):
+                ident = self.identify(fresh=True)
+                if not ident or not self.authorize(ident):
+                    return
+                mid = path[len("/requests/"):]
+                state = (incoming_request_status(ctx, mid, ident["node"]) or
+                         incoming_request_status(ctx, mid, peer_identity(ident))) if ID_RE.fullmatch(mid) else None
+                return self.reply(200, {"ok": True, "request": state}) if state else self.reply(404, {"ok": False, "error": "request not found"})
             m = re.match(r"^/f/([^/]+)/([^/]+)$", path)
             if not m:
                 return self.reply(404, {"ok": False, "error": "not found"})
@@ -586,9 +2579,13 @@ def make_handler(ctx, me):
             if not TOKEN_RE.match(token) or not (d / "meta.json").is_file():
                 return self.reply(404, {"ok": False, "error": "not found"})
             meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
-            if parse_iso(meta["expires"]) <= now_utc():
+            if meta.get("persistent_request"):
+                ident = self.identify(fresh=True)
+                if not ident or not self.authorize(ident):
+                    return
+            if not meta.get("persistent_request") and parse_iso(meta["expires"]) <= now_utc():
                 return self.reply(404, {"ok": False, "error": "expired"})
-            if ident["node"] != meta["to"]:
+            if meta["to"] not in (ident["node"], peer_identity(ident)):
                 return self.reply(404, {"ok": False, "error": "not found"})
             if name not in meta["files"]:
                 return self.reply(404, {"ok": False, "error": "not found"})
@@ -601,10 +2598,76 @@ def make_handler(ctx, me):
             with open(fp, "rb") as f:
                 shutil.copyfileobj(f, self.wfile, 1 << 20)
 
-        def do_POST(self):
-            if urllib.parse.urlparse(self.path).path != "/msg":
+        def do_PUT(self):
+            match = re.fullmatch(r"/requests/([A-Za-z0-9_-]{8,64})/uploads/([A-Za-z0-9_-]{32,64})",
+                                 urllib.parse.urlparse(self.path).path)
+            if not match:
                 return self.reply(404, {"ok": False, "error": "not found"})
-            ident = self.identify()
+            ident = self.identify(fresh=True)
+            if not ident or not self.authorize(ident):
+                return
+            mid, token = match.groups()
+            item = pull_upload_manifest(ctx, mid, peer_identity(ident), token)
+            if item is None:
+                return self.reply(404, {"ok": False, "error": "upload not found or request already committed"})
+            lengths = self.headers.get_all("Content-Length") or []
+            if len(lengths) != 1 or self.headers.get("Transfer-Encoding"):
+                return self.reply(411, {"ok": False, "error": "one Content-Length required"})
+            try:
+                size = int(lengths[0])
+            except ValueError:
+                size = -1
+            if size != item["size"] or size < 0 or size > cfg["max_fetch_bytes"]:
+                return self.reply(413, {"ok": False, "error": "upload length does not match manifest or limit"})
+            directory = ctx.home / "requests" / "uploads" / mid
+            private_mkdir(directory)
+            destination = directory / token
+            temporary = directory / (token + ".part-" + secrets.token_hex(8))
+            existed, digest, remaining = destination.is_file(), hashlib.sha256(), size
+            old_timeout = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(30)
+                with private_open(temporary) as stream:
+                    while remaining:
+                        chunk = self.rfile.read(min(1 << 20, remaining))
+                        if not chunk:
+                            raise ValueError("incomplete upload")
+                        stream.write(chunk)
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                if digest.hexdigest() != item["sha256"]:
+                    raise ValueError("upload sha256 mismatch")
+                # Recheck local identity, peer access and reservation after a potentially long upload.
+                if not self.check_receiver_identity():
+                    return
+                try:
+                    current = fresh_whois(ctx, self.client_address[0])
+                except TailscaleUnavailable:     # PR #17: retryable; the sender resumes the same request
+                    self.close_connection = True
+                    return self.reply(503, {"ok": False, "error": "identity lookup unavailable",
+                                            "code": "identity_unavailable"}, {"Retry-After": "1"})
+                if (not current or peer_identity(current) != peer_identity(ident) or not ctx.access_decision(current)[0] or
+                        pull_upload_manifest(ctx, mid, peer_identity(current), token) != item):
+                    return self.reply(409, {"ok": False, "error": "upload authorization or request state changed"})
+                os.replace(temporary, destination)
+                sync_directory(directory)
+                return self.reply(200 if existed else 201, {"ok": True, "id": mid, "token": token,
+                                                          "sha256": item["sha256"], "size": size})
+            except (OSError, ValueError) as exc:
+                self.close_connection = True
+                return self.reply(400, {"ok": False, "error": str(exc) if isinstance(exc, ValueError) else "incomplete upload"})
+            finally:
+                self.connection.settimeout(old_timeout)
+                if temporary.exists():
+                    temporary.unlink()
+
+        def do_POST(self):
+            route = urllib.parse.urlparse(self.path).path
+            if route not in ("/msg", "/requests/prepare"):
+                return self.reply(404, {"ok": False, "error": "not found"})
+            ident = self.identify(fresh=route == "/requests/prepare")
             if not ident:
                 return
             if not self.authorize(ident):
@@ -628,28 +2691,65 @@ def make_handler(ctx, me):
             err = validate_env(env)
             if err:
                 return self.reply(400, {"ok": False, "error": err})
-            if env["from"].lower().rstrip(".") != ident["node"]:
+            if is_pull_request(env) and route == "/msg":
+                ident = self.identify(fresh=True)
+                if not ident or not self.authorize(ident):
+                    return
+            if not sender_matches(env, ident):
                 return self.reply(403, {"ok": False, "error": "'from' does not match tailscale identity %s" % ident["node"]})
             if env["to"].lower().rstrip(".") not in (me, me.split(".")[0]):
                 return self.reply(400, {"ok": False, "error": "misdirected: I am %s" % me})
-            path = ctx.inbox / (env["id"] + ".json")
-            if path.exists():
-                return self.reply(200, {"ok": True, "id": env["id"], "duplicate": True})
-            requested = env.get("wake", WAKE_DEFAULT)
-            agent, astatus = ctx.resolve_agent(env.get("agent"))
-            eff, why = ctx.wake_decision(requested, ident, agent=agent, agent_status=astatus)
-            rec = {"envelope": env, "received": {"at": iso(now_utc()), "peer": ident,
-                   "agent": agent, "agent_status": astatus,
-                   "wake": {"requested": requested, "effective": eff, "reason": why}}}
-            atomic_write(path, json.dumps(rec, ensure_ascii=False, indent=2).encode("utf-8"))
-            log("message", env["id"], "from", ident["node"] + ("/" + env["from_agent"] if env.get("from_agent") else ""),
-                "to @%s (%s)" % (agent, astatus), "files=%d" % len(env.get("fetch", [])),
-                "wake=%s->%s (%s)" % (requested, eff, why))
-            if astatus == "unknown":
-                log("WARNING: message", env["id"], "addressed to unknown agent %r: stored, nobody woken" % agent)
-            if eff == "now":
-                run_hook(ctx, path)
-            return self.reply(202, {"ok": True, "id": env["id"]})
+            if not self.check_receiver_identity():
+                return
+            if route == "/requests/prepare":
+                try:
+                    fresh = prepare_pull_request(ctx, env, ident)
+                except ValueError as exc:
+                    return self.reply(409, {"ok": False, "error": str(exc)})
+                return self.reply(201 if fresh else 200, {"ok": True, "id": env["id"],
+                    "committed": request_snapshot(ctx.home, env["id"]) is not None})
+            if is_pull_request(env):
+                # Persist the authenticated canonical principal, not a name supplied by the sender.
+                ident = dict(ident, node=peer_identity(ident))
+            with ctx._inbox_lock:
+                path = ctx.inbox / (env["id"] + ".json")
+                if "response" in env:
+                    try:
+                        fresh = accept_response(ctx, env, ident["node"])
+                    except ValueError as exc:
+                        return self.reply(409, {"ok": False, "error": str(exc)})
+                    return self.reply(202 if fresh else 200, {"ok": True, "id": env["id"], "duplicate": not fresh})
+                if path.exists():
+                    previous = json.loads(path.read_text(encoding="utf-8"))
+                    if previous.get("received", {}).get("peer", {}).get("node") != ident["node"] or previous.get("envelope") != env:
+                        return self.reply(409, {"ok": False, "error": "message ID conflicts with existing message"})
+                    return self.reply(200, {"ok": True, "id": env["id"], "duplicate": True})
+                requested = env.get("wake", WAKE_DEFAULT)
+                agent, astatus = ctx.resolve_agent(env.get("agent"))
+                eff, why = ctx.wake_decision(requested, ident, agent=agent, agent_status=astatus)
+                rec = {"envelope": env, "received": {"at": iso(now_utc()), "peer": ident, "node": me,
+                       "agent": agent, "agent_status": astatus,
+                       "wake": {"requested": requested, "effective": eff, "reason": why}}}
+                if "request" in env:
+                    try:
+                        if is_pull_request(env):
+                            materialize_pull_uploads(ctx, env, ident)
+                        fresh = accept_request(ctx, rec)
+                    except ValueError as exc:
+                        return self.reply(409, {"ok": False, "error": str(exc)})
+                    if not fresh:
+                        recover_request_inbox(ctx)
+                        return self.reply(200, {"ok": True, "id": env["id"], "duplicate": True})
+                atomic_write(path, json.dumps(rec, ensure_ascii=False, indent=2).encode("utf-8"))
+                log("message", env["id"], "from", ident["node"] + ("/" + env["from_agent"] if env.get("from_agent") else ""),
+                    "to @%s (%s)" % (agent, astatus), "files=%d" % len(
+                        env["request"].get("uploads", []) if is_pull_request(env) else env.get("fetch", [])),
+                    "wake=%s->%s (%s)" % (requested, eff, why))
+                if astatus == "unknown":
+                    log("WARNING: message", env["id"], "addressed to unknown agent %r: stored, nobody woken" % agent)
+                if eff == "now" and ("request" not in env or request_snapshot(ctx.home, env["id"])["state"] not in REQUEST_FINAL + ("timed_out",)):
+                    run_hook(ctx, path)
+                return self.reply(202, {"ok": True, "id": env["id"]})
 
     return H
 
@@ -931,7 +3031,7 @@ def info_payload(home, cfg, agents, me, native_name):
         out.append({"agent": name, "default": name == cfg.get("default_agent"),
                     "session": session_view(b, native_name(b)) if b else None})
     return {"ok": True, "v": VERSION, "product": PRODUCT, "version": PRODUCT_VERSION, "node": me,
-            "agents": out, "agents_total": total, "agents_truncated": total > len(names),
+            "capabilities": [REQUEST_CAPABILITY, REQUEST_PULL_CAPABILITY], "agents": out, "agents_total": total, "agents_truncated": total > len(names),
             "generated_at": iso(now_utc())}
 
 
@@ -1021,10 +3121,69 @@ def wake_payload(rec):
     return d
 
 
+# The only error codes a webhook diagnostic may name: generic categories, printed in this spelling and never as
+# received, so no prefix, suffix or variant of a remote code can carry private text into a log.
+WEBHOOK_ERROR_CODES = frozenset((
+    "bad_request", "invalid_request", "invalid_payload", "invalid_json", "invalid_hook", "unknown_hook",
+    "unauthorized", "invalid_token", "expired_token", "invalid_signature", "forbidden", "not_found",
+    "method_not_allowed", "conflict", "payload_too_large", "unsupported_media_type", "rate_limited",
+    "too_many_requests", "internal_error", "bad_gateway", "service_unavailable", "gateway_timeout", "timeout"))
+WEBHOOK_RETRY_AFTER_RE = re.compile(r"[0-9]{1,5}\Z")
+# Likewise the only Retry-After delays it may name: any other number could wrap digits that were sent (a PIN
+# inside 15739), so it is left out.
+WEBHOOK_RETRY_AFTER_SECONDS = frozenset((1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600))
+
+
+def webhook_sensitive(url, secret, payload):
+    """What a webhook must never get back into logs or inbox records: the secret, each part of the URL that can
+    carry a token (credentials, host, path, query, fragment and their segments, decoded too) and the message
+    values sent in the payload. Every non-empty value counts, however short. The port is no secret: a number
+    that only appears in it does not hide a Retry-After."""
+    u = urllib.parse.urlsplit(url)
+    values = [secret, u.hostname, u.path, u.query, u.fragment, u.username, u.password]
+    values += re.split(r"[/;,&=?#]+", "%s?%s#%s" % (u.path, u.query, u.fragment))
+    values += [payload.get(k) for k in ("id", "from", "agent", "from_agent", "text_preview")]
+    values += [urllib.parse.unquote(v) for v in list(values) if isinstance(v, str)]
+    return sorted({v for v in values if isinstance(v, str) and v}, key=len, reverse=True)
+
+
+def repeats_sent(value, sensitive):
+    """Whether a value from a webhook answer overlaps anything that was sent to it, ignoring case."""
+    low = value.lower()
+    return any(v.lower() in low or low in v.lower() for v in sensitive)
+
+
+def webhook_error(status, retry_after, body, sensitive):
+    """Bounded, non-secret diagnostics for a non-2xx webhook answer. A webhook can echo anything it received
+    (its own path, headers, the message), so no free text from the body is ever kept: only the HTTP status, one
+    error code from a JSON body (`code`, `error_code`, `error` or `error.code`) that names a category of the
+    fixed WEBHOOK_ERROR_CODES, such as `invalid_hook`, and a Retry-After of the fixed WEBHOOK_RETRY_AFTER_SECONDS,
+    each kept only when it repeats nothing that was sent (the Retry-After neither as written nor without its
+    leading zeros)."""
+    detail = []
+    try:
+        obj = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        obj = None
+    if isinstance(obj, dict):
+        nested = obj.get("error") if isinstance(obj.get("error"), dict) else {}
+        for code in (obj.get("code"), obj.get("error_code"), obj.get("error"), nested.get("code")):
+            low = code.lower() if isinstance(code, str) else ""
+            if low in WEBHOOK_ERROR_CODES and not repeats_sent(low, sensitive):
+                detail.append("code " + low)
+                break
+    seconds = retry_after.strip() if isinstance(retry_after, str) else ""
+    if (WEBHOOK_RETRY_AFTER_RE.match(seconds) and int(seconds) in WEBHOOK_RETRY_AFTER_SECONDS
+            and not any(repeats_sent(v, sensitive) for v in (seconds, str(int(seconds))))):
+        detail.append("retry after %d s" % int(seconds))
+    return "HTTP %d" % status + (" (%s)" % ", ".join(detail) if detail else "")
+
+
 def call_webhook(a, rec, timeout):
     url = read_secret_value(a, "url")
     secret = read_secret_value(a, "secret")
-    redact = lambda s: s.replace(url, "<url>").replace(secret, "<secret>") if secret else s.replace(url, "<url>")
+    payload = wake_payload(rec)
+    sensitive = webhook_sensitive(url, secret, payload)
     u = urllib.parse.urlparse(url)
     if u.scheme not in ("http", "https") or not u.hostname:
         raise AdapterError("webhook url must be http(s)://")
@@ -1034,7 +3193,8 @@ def call_webhook(a, rec, timeout):
             raise AdapterError("secret contains a newline")
         scheme = a.get("scheme", "Bearer")
         headers[a.get("header", "Authorization")] = (scheme + " " + secret) if scheme else secret
-    body = json.dumps(wake_payload(rec), ensure_ascii=False).encode("utf-8")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    c = None
     try:
         if u.scheme == "https":
             c = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout, context=ssl.create_default_context())
@@ -1042,12 +3202,14 @@ def call_webhook(a, rec, timeout):
             c = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
         c.request("POST", (u.path or "/") + ("?" + u.query if u.query else ""), body=body, headers=headers)
         r = c.getresponse()
-        r.read(4096)
-        c.close()
-    except Exception as e:  # never let the url/secret reach the log via the exception text
-        raise AdapterError(redact("%s: %s" % (type(e).__name__, e)))
+        resp = r.read(4096)
+    except Exception as e:  # only the type: its text can echo the URL, secret or message, in any case or encoding
+        raise AdapterError(type(e).__name__)
+    finally:
+        if c is not None:
+            c.close()
     if not 200 <= r.status < 300:  # redirects are not followed (would forward the secret)
-        raise AdapterError("HTTP %d" % r.status)
+        raise AdapterError(webhook_error(r.status, r.getheader("Retry-After"), resp, sensitive))
     return "HTTP %d" % r.status
 
 
@@ -1089,7 +3251,8 @@ def wake_access_decision(ctx, rec):
 
 
 def deliver_wake(ctx, path):
-    """Run the adapter with retries. Returns True on success. Records the outcome (no secrets) in the
+    """Run the adapter with retries. Returns True on adapter success, even if recording fails.
+    Best-effort recording of the outcome (no secrets) goes in the
     inbox record as `wake_delivery`; on give-up the message simply stays in `inbox --pending`."""
     mid = Path(path).stem
     try:
@@ -1111,21 +3274,40 @@ def deliver_wake(ctx, path):
     for n in range(1, attempts + 1):
         try:
             rec = json.loads(Path(path).read_text(encoding="utf-8"))
+            if "response" in rec.get("envelope", {}):
+                err = "protocol receipts/results must not wake an agent"
+                log("wake", mid, "stopped:", err)
+                break
+            if "request" in rec.get("envelope", {}):
+                snapshot = request_snapshot(ctx.home, mid)
+                if not snapshot or snapshot["state"] in REQUEST_FINAL + ("timed_out",):
+                    err = "tracked request expired, finalized, or missing durable state; execution was not restarted"
+                    log("wake", mid, "stopped:", err)
+                    break
             allowed, reason = wake_access_decision(ctx, rec)
             if not allowed:
                 err = "access policy: " + reason
                 log("wake", mid, "stopped before adapter invocation:", reason)
                 break
+            identity_error = receiver_identity_error(ctx)
+            if identity_error:
+                err = identity_error
+                break
             attempted += 1
             res = call_webhook(a, rec, timeout) if a["type"] == "webhook" else call_exec(a, path, timeout, agent)
-            log("wake", mid, "@%s" % agent, a["type"], "ok (attempt %d): %s" % (n, res))
-            update_record(path, wake_delivery={"adapter": a["type"], "agent": agent, "ok": True, "attempts": attempted,
-                                               "at": iso(now_utc())})
-            return True
         except AdapterError as e:
             err = str(e)[-300:]
         except Exception as e:
             err = type(e).__name__
+        else:
+            # Notification succeeded. A bookkeeping failure must never send it again.
+            log("wake", mid, "@%s" % agent, a["type"], "ok (attempt %d): %s" % (n, res))
+            try:
+                update_record(path, wake_delivery={"adapter": a["type"], "agent": agent, "ok": True, "attempts": attempted,
+                                                   "at": iso(now_utc())})
+            except Exception as e:
+                log("wake", mid, "adapter succeeded but could not record wake_delivery:", type(e).__name__)
+            return True
         log("wake", mid, "@%s" % agent, a["type"], "failed (attempt %d/%d): %s" % (n, attempts, err))
         if n < attempts:
             time.sleep(backoff * 2 ** (n - 1))
@@ -1143,18 +3325,299 @@ def run_hook(ctx, path):
 
 
 def sweep_outbox(ctx):
+    """Delete expired attachment grants (one hour after expiry); each entry is handled on its own.
+
+    -> counts. Unexpired grants are kept. An entry without metadata may still be prepared by a send: it is
+    kept and counted as incomplete. Unreadable metadata and failed deletions are failures: the pass continues,
+    then raises PhaseIncomplete so it is never reported as success. An outbox that cannot be listed raises."""
     now = now_utc()
+    counts = {"scanned": 0, "active": 0, "deleted": 0, "incomplete": 0, "failed": 0, "ignored": 0}
     for d in ctx.outbox.iterdir():
+        counts["scanned"] += 1
+        if d.is_symlink() or not d.is_dir():
+            counts["ignored"] += 1
+            continue
+        if not os.path.lexists(str(d / "meta.json")):
+            counts["incomplete"] += 1
+            continue
         try:
             meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
-            if parse_iso(meta["expires"]) + dt.timedelta(hours=1) < now:
-                shutil.rmtree(d, ignore_errors=True)
+            expired = not meta.get("persistent_request") and \
+                parse_iso(meta["expires"]) + dt.timedelta(hours=1) < now
         except Exception:
+            counts["failed"] += 1
+            continue
+        if not expired:
+            counts["active"] += 1
+            continue
+        try:
+            shutil.rmtree(str(d))
+            counts["deleted"] += 1
+        except OSError:
+            counts["failed"] += 1
+    if counts["failed"]:
+        raise PhaseIncomplete("attachment_cleanup_failed", counts)
+    return counts
+
+
+# ---------------------------------------------------------------- receiver maintenance supervision
+MAINTENANCE_FILE = "maintenance.json"
+HEARTBEAT_EVERY = 10              # seconds between routine heartbeat writes; changes are written at once
+RESTART_BACKOFF_MAX = 60
+
+
+def maintenance_workers():
+    """name -> (phases, interval seconds, stale_after seconds). Local request lifecycle work and network
+    response delivery are separate workers, so a slow or failing peer never delays expiry. stale_after is a
+    diagnostic threshold only: a live worker is never restarted or duplicated because of it."""
+    return {"requests": (REQUEST_PHASES[:2], 1, 120),
+            "responses": (REQUEST_PHASES[2:], 1, 1800),
+            "attachments": ((("sweep", lambda ctx: sweep_outbox(ctx)),), 300, 3600)}
+
+
+class MaintenanceWorker(object):
+    def __init__(self, name, phases, interval, stale_after):
+        self.name, self.phases, self.interval, self.stale_after = name, tuple(phases), interval, stale_after
+        self.thread = None
+        self.generation = self.restarts = self.streak = self.cycles = self.failures = 0
+        self.next_restart = 0.0          # monotonic; bounded backoff between restarts of a dying worker
+        self.started = self.started_at = None
+        self.cycle_started = self.cycle_started_at = self.phase = None
+        self.outcomes, self.counts, self.last_cycle_at = {}, {}, None
+        self.success = self.success_at = None     # end of the last cycle in which every phase succeeded
+        self.failure = None              # {"phase", "error", "at"[, "exit"]} until a full cycle succeeds again
+        self.exit = None                 # the last unexpected thread exit, kept as history
+
+
+class Maintenance(object):
+    """Supervises the receiver's maintenance workers: request lifecycle (inbox recovery, expiry), response
+    delivery and attachment cleanup.
+
+    service_actions() runs on the HTTP serving loop and only inspects real Thread objects: a worker whose thread
+    has ended gets one replacement, after a short bounded backoff. A live worker is never restarted or
+    duplicated, however long its cycle takes; staleness is reported, not acted on. A cycle attempts every phase
+    and is a full success only when all succeed. Workers persist a metadata-only heartbeat (atomic, 0600,
+    fsynced); a failed write degrades health until a later write succeeds. Each process has a new instance id,
+    so an earlier process's heartbeat is never mistaken for a live worker."""
+
+    def __init__(self, ctx, workers=None, clock=time.monotonic, heartbeat_every=HEARTBEAT_EVERY):
+        self.ctx, self.clock, self.heartbeat_every = ctx, clock, heartbeat_every
+        self.instance, self.started_at = secrets.token_hex(8), iso(now_utc())
+        self.lock, self.write_lock, self.stop = threading.Lock(), threading.Lock(), threading.Event()
+        self.path = Path(ctx.home) / MAINTENANCE_FILE
+        self.workers = {name: MaintenanceWorker(name, phases, interval, stale_after)
+                        for name, (phases, interval, stale_after) in (workers or maintenance_workers()).items()}
+        self.heartbeat_failed, self.heartbeat_failures, self.heartbeat_error = False, 0, None
+        self.heartbeat_attempt = None
+
+    def start(self):
+        self._clean_temporary()
+        for worker in self.workers.values():
+            self._launch(worker)
+
+    def _launch(self, worker):
+        """Start a worker thread. If the thread cannot start (for example a thread limit), the failure is
+        recorded and the never-started thread counts as dead, so the supervisor retries with backoff while
+        the listener keeps serving and reports itself degraded."""
+        with self.lock:
+            worker.generation += 1
+            worker.started, worker.started_at = self.clock(), iso(now_utc())
+            worker.cycle_started = worker.cycle_started_at = worker.phase = None
+            worker.thread = threading.Thread(target=self._run, args=(worker,), daemon=True,
+                                             name="yobiru-maintenance-" + worker.name)
+            thread = worker.thread
+        try:
+            thread.start()
+        except Exception as exc:
+            error, at = type(exc).__name__, iso(now_utc())
+            with self.lock:
+                worker.exit = {"error": error, "at": at}
+                worker.failure = {"phase": "start", "error": error, "at": at, "exit": True}
+            log("maintenance worker %s could not start: %s" % (worker.name, error))
+
+    def service_actions(self):
+        try:
+            self.supervise()
+        except Exception as exc:          # supervision must never stop the serving loop
+            log("maintenance supervision failed:", type(exc).__name__)
+
+    def supervise(self):
+        """Restart only workers whose thread has actually ended; never a live one, however stale."""
+        if self.stop.is_set():
+            return
+        for worker in self.workers.values():
+            with self.lock:
+                now = self.clock()
+                if worker.thread is None or worker.thread.is_alive() or now < worker.next_restart:
+                    continue
+                worker.restarts += 1
+                worker.streak += 1
+                worker.next_restart = now + min(RESTART_BACKOFF_MAX, 2 ** min(worker.streak, 6))
+            log("maintenance worker %s had stopped; starting a replacement (restart %d)" % (worker.name, worker.restarts))
+            self._launch(worker)
+
+    def _run(self, worker):
+        try:
+            while not self.stop.is_set():
+                self._cycle(worker)
+                if self.stop.wait(worker.interval):
+                    break
+        except BaseException as exc:      # including SystemExit: recorded; the supervisor decides about a restart
+            error, at = type(exc).__name__, iso(now_utc())
+            with self.lock:
+                worker.exit = {"error": error, "at": at}
+                worker.failure = {"phase": worker.phase or "loop", "error": error, "at": at, "exit": True}
+                worker.cycle_started = worker.cycle_started_at = worker.phase = None
+            log("maintenance worker %s stopped unexpectedly: %s" % (worker.name, error))
+            self.persist(force=True)
+
+    def _cycle(self, worker):
+        with self.lock:
+            worker.cycles += 1
+            worker.cycle_started, worker.cycle_started_at = self.clock(), iso(now_utc())
+        outcomes, counts, failure = {}, {}, None
+        for name, fn in worker.phases:
+            with self.lock:
+                worker.phase = name
+            outcome, result, error = run_phase(fn, self.ctx)
+            outcomes[name] = outcome
+            if result:
+                counts[name] = result
+            if error and failure is None:
+                failure = {"phase": name, "error": error}
+        at = iso(now_utc())
+        with self.lock:
+            before = worker.failure
+            worker.phase = worker.cycle_started = worker.cycle_started_at = None
+            changed = worker.outcomes != outcomes
+            worker.outcomes, worker.counts, worker.last_cycle_at = outcomes, counts, at
+            if failure:
+                failure["at"] = at
+                worker.failure, worker.failures = failure, worker.failures + 1
+            elif all(outcome == "ok" for outcome in outcomes.values()):
+                worker.failure, worker.failures, worker.streak = None, 0, 0
+                worker.success, worker.success_at = self.clock(), at
+        if failure and (before is None or (before["phase"], before["error"]) != (failure["phase"], failure["error"])):
+            log("maintenance %s: phase %s failed: %s" % (worker.name, failure["phase"], failure["error"]))
+        elif before is not None and worker.failure is None:
+            log("maintenance %s: full cycle completed again" % worker.name)
+        self.persist(force=changed or (before is None) != (worker.failure is None))
+
+    def persist(self, force=False):
+        """Write the metadata heartbeat; routine writes at most every `heartbeat_every` seconds."""
+        with self.write_lock:
+            now = self.clock()
+            if not force and self.heartbeat_attempt is not None and now - self.heartbeat_attempt < self.heartbeat_every:
+                return
+            self.heartbeat_attempt = now
+            try:
+                write_private_json(self.path, self.snapshot(detail=True))
+            except Exception as exc:
+                with self.lock:
+                    first = not self.heartbeat_failed
+                    self.heartbeat_failed, self.heartbeat_error = True, type(exc).__name__
+                    self.heartbeat_failures += 1
+                if first:
+                    log("maintenance heartbeat could not be written:", type(exc).__name__)
+            else:
+                with self.lock:
+                    recovered, self.heartbeat_failed = self.heartbeat_failed, False
+                if recovered:
+                    log("maintenance heartbeat written again")
+
+    def _clean_temporary(self):
+        """Remove heartbeat temporary files a killed process left behind (older than a minute)."""
+        try:
+            for path in Path(self.ctx.home).glob("." + MAINTENANCE_FILE + ".*.tmp"):
+                try:
+                    if time.time() - path.lstat().st_mtime > 60:
+                        path.unlink()
+                except OSError:
+                    pass
+        except OSError:
             pass
+
+    @staticmethod
+    def _status(worker, now):
+        if worker.thread is None or not worker.thread.is_alive():
+            return "dead", "worker_dead"
+        if worker.failure:
+            return "failed", "worker_restarted" if worker.failure.get("exit") else "cycle_failed"
+        if worker.success is None:
+            return ("starting", None) if now - worker.started <= worker.stale_after else ("stalled", "no_completed_cycle")
+        if now - worker.success > worker.stale_after:
+            return "stalled", "no_recent_full_cycle"
+        return "ok", None
+
+    def snapshot(self, detail=False):
+        """Aggregate status (for /health) or, with detail, the metadata heartbeat document. Live state only:
+        the actual thread objects and monotonic times of this process."""
+        now = self.clock()
+        age = lambda t: None if t is None else round(max(0.0, now - t), 1)
+        with self.lock:
+            components, workers, reasons = {}, {}, []
+            for worker in self.workers.values():
+                status, reason = self._status(worker, now)
+                components[worker.name] = status
+                if reason and reason not in reasons:
+                    reasons.append(reason)
+                if detail:
+                    workers[worker.name] = {
+                        "status": status, "alive": bool(worker.thread and worker.thread.is_alive()),
+                        "generation": worker.generation, "restarts": worker.restarts,
+                        "interval_seconds": worker.interval, "stale_after_seconds": worker.stale_after,
+                        "thread_started_at": worker.started_at, "cycles": worker.cycles,
+                        "in_cycle_since": worker.cycle_started_at, "in_cycle_seconds": age(worker.cycle_started),
+                        "phase": worker.phase, "last_cycle_at": worker.last_cycle_at,
+                        "last_outcomes": dict(worker.outcomes),
+                        "last_counts": {k: dict(v) for k, v in worker.counts.items()},
+                        "last_full_success_at": worker.success_at, "last_full_success_age_seconds": age(worker.success),
+                        "failure": dict(worker.failure) if worker.failure else None,
+                        "consecutive_failures": worker.failures, "last_exit": dict(worker.exit) if worker.exit else None}
+            if self.heartbeat_failed:
+                reasons.append("heartbeat_write_failed")
+            statuses = set(components.values())
+            state = "degraded" if statuses & {"dead", "failed", "stalled"} or self.heartbeat_failed else \
+                "starting" if "starting" in statuses else "healthy"
+            if not detail:
+                return {"supported": True, "status": state, "components": components, "reasons": reasons,
+                        "instance": self.instance}
+            return {"schema": 1, "instance": self.instance, "started_at": self.started_at,
+                    "written_at": iso(now_utc()), "status": state, "reasons": reasons, "workers": workers,
+                    "heartbeat": {"every_seconds": self.heartbeat_every, "failures": self.heartbeat_failures,
+                                  "last_error": self.heartbeat_error}}
+
+
+def health_payload(ctx, me):
+    """GET /health for any tailnet address: receiver liveness, aggregate maintenance status, component states
+    and fixed reason codes only. `ok` is false while maintenance is degraded, so a reachable but impaired
+    receiver never looks healthy. Timings, counts and backlog stay local (maintenance.json, doctor)."""
+    body = {"ok": True, "v": VERSION, "node": me, "receiver_alive": True}
+    maintenance = getattr(ctx, "maintenance", None)
+    if maintenance is None:
+        body.update(status="unknown", maintenance={"supported": False})
+    else:
+        summary = maintenance.snapshot()
+        body.update(ok=summary["status"] != "degraded", status=summary["status"], maintenance=summary)
+    if getattr(ctx, "receiver_identity", None) is not None:
+        error = receiver_identity_error(ctx)
+        body["receiver_identity"] = {"status": error or "ok", "restart_required": error == "receiver_identity_changed"}
+        if error:
+            body.update(ok=False, status="degraded")
+    return body
+
+
+class NumericHTTPServer(ThreadingHTTPServer):
+    """Bind normally, but do not require reverse DNS for HTTP server metadata."""
+
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 def cmd_serve(ctx, a):
     me = ctx.self_node()
+    ctx.receiver_identity = ReceiverIdentity(ctx, me)
     bind = ctx.cfg.get("bind") or ctx.ts("ip", "-4").split()[0]
     port = int(ctx.cfg["port"])
     if ctx.cfg["access_policy"] == "allowlist" and not ctx.cfg["allow"]:
@@ -1170,32 +3633,85 @@ def cmd_serve(ctx, a):
         log("wake adapter%s:" % tag, desc)
     if ctx.cfg.get("self_agent"):
         log("self_agent (sent as from_agent):", ctx.cfg["self_agent"])
-    srv = ThreadingHTTPServer((bind, port), make_handler(ctx, me["node"]))
+    srv = NumericHTTPServer((bind, port), make_handler(ctx, me["node"]))
     srv.daemon_threads = True
-
-    def sweeper():
-        while True:
-            sweep_outbox(ctx)
-            time.sleep(300)
-    threading.Thread(target=sweeper, daemon=True).start()
+    # Request lifecycle, response delivery and attachment cleanup run as supervised workers; the serving loop
+    # restarts only a worker whose thread has ended (see Maintenance).
+    ctx.maintenance = Maintenance(ctx)
+    srv.service_actions = ctx.maintenance.service_actions
+    ctx.maintenance.start()
     log("tailmsg v%d serving %s on %s:%d  home=%s" % (VERSION, me["node"], bind, port, ctx.home))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        ctx.maintenance.stop.set()
 
 
 # ---------------------------------------------------------------- client
-def http_json(ip, port, method, path, body=None, host=None, timeout=15):
+class TransportError(RuntimeError):
+    """No complete HTTP response was received; a write may already have reached the peer."""
+
+
+def _expire_exchange(sock, expired):
+    expired.set()
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def transport_diagnostic(peer, ip, port, operation, error):
+    """Describe the attempted route, without guessing the failed network layer or exposing URLs."""
+    endpoint = "[%s]:%s" % (ip, port) if ":" in ip else "%s:%s" % (ip, port)
+    # BadStatusLine can contain arbitrary peer output, including an echoed attachment grant URL.
+    reason = "invalid or incomplete HTTP response" if isinstance(error, http.client.HTTPException) else str(error)
+    reason = "".join(" " if unicodedata.category(c).startswith("C") else c for c in reason[:200])
+    return ("%s to %s (%s) failed: %s: %s. Check that the receiver is running on port %s; "
+            "check the Tailscale path with `tailscale ping --c 3 --timeout 3s %s` "
+            "(a successful ping does not verify the receiver or its access policy)." %
+            (operation, peer, endpoint, type(error).__name__, reason, port, shlex.quote(peer)))
+
+
+def http_json(ip, port, method, path, body=None, host=None, timeout=15, deadline=None, limit=None):
+    """`timeout` limits each socket operation, not the exchange: a peer that trickles bytes can hold it longer.
+    With `deadline`, the connected socket is shut down that many seconds after connecting and the exchange
+    fails even if a usable prefix arrived. With `limit`, a body larger than `limit` bytes, or one that does not
+    match its Content-Length, fails: a truncated response is never treated as a complete reply."""
     c = http.client.HTTPConnection(ip, port, timeout=timeout)
     hdrs = {"Host": "%s:%d" % (host or ip, port)}
     data = None
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         hdrs["Content-Type"] = "application/json"
-    c.request(method, path, body=data, headers=hdrs)
-    r = c.getresponse()
-    raw = r.read()
+    timer, expired = None, threading.Event()
+    try:
+        if deadline is not None:
+            c.connect()                       # bounded by `timeout`
+            sock = c.sock                     # kept: a `Connection: close` reply detaches c.sock while reading
+            timer = threading.Timer(deadline, _expire_exchange, args=(sock, expired))
+            timer.daemon = True
+            timer.start()
+        c.request(method, path, body=data, headers=hdrs)
+        r = c.getresponse()
+        length = None if r.chunked else r.length      # the declared Content-Length, before reading
+        raw = r.read() if limit is None else r.read(limit + 1)
+        if expired.is_set():
+            raise socket.timeout("exchange deadline exceeded")
+        if limit is not None and (len(raw) > limit or (length is not None and len(raw) != length)):
+            raise http.client.IncompleteRead(raw[:0], None)
+    except (OSError, http.client.HTTPException) as e:
+        detail = transport_diagnostic(host or ip, ip, port, "%s %s" % (method, path), e)
+        if method == "POST" and path == "/msg":
+            detail += (" Delivery is unknown for message %s; the receiver may already have stored it. "
+                       "Check its inbox for this ID before sending again; a new send creates a new ID." %
+                       (body or {}).get("id", "(unknown)"))
+        raise TransportError(detail) from e
+    finally:
+        if timer is not None:
+            timer.cancel()
+        c.close()
     try:
         return r.status, json.loads(raw)
     except Exception:
@@ -1217,6 +3733,221 @@ def split_peer(peer, default_port):
     return peer, default_port
 
 
+def prepare_attachments(ctx, a, env, to_fqdn, persistent_request=None):
+    me, msg_id = env["from"], env["id"]
+    if a.file:
+        if persistent_request and a.ttl_hours is not None:
+            raise ValueError("pull result attachments are persistent; --ttl-hours is not supported")
+        if persistent_request and (len(a.file) > 100 or
+                sum(Path(f).stat().st_size for f in a.file) > ctx.cfg["max_fetch_bytes"]):
+            raise ValueError("result attachments exceed count or max_fetch_bytes limit")
+        ttl = a.ttl_hours if a.ttl_hours is not None else ctx.cfg["outbox_ttl_hours"]
+        expires = iso(now_utc() + dt.timedelta(seconds=int(ttl * 3600)))
+        token = secrets.token_urlsafe(32)
+        d = ctx.outbox / token
+        private_mkdir(d / "files")
+        try:
+            items = stage_attachment_files(ctx, a, d, me, msg_id, to_fqdn, token, expires, persistent_request)
+        except BaseException:
+            shutil.rmtree(d, ignore_errors=True)       # nothing refers to a copy that was never completed
+            raise
+        env["fetch"] = items
+        return d
+    return None
+
+
+def stage_attachment_files(ctx, a, d, me, msg_id, to_fqdn, token, expires, persistent_request):
+    """Snapshot each file under outbox/<token>/files and write meta.json -> the fetch entries."""
+    meta = {"id": msg_id, "to": to_fqdn, "expires": expires, "files": {}}
+    if persistent_request:
+        meta["persistent_request"] = persistent_request
+    items = []
+    copied_bytes = 0
+    for f in a.file:
+        src = Path(f)
+        if not src.is_file():
+            die("not a file: %s" % f)
+        name = safe_name(src.name)
+        while name in meta["files"]:
+            name = "_" + name
+        dst = d / "files" / name
+        if persistent_request:
+            with open(src, "rb") as reader, private_open(dst) as writer:
+                while True:
+                    chunk = reader.read(1 << 20)
+                    if not chunk:
+                        break
+                    copied_bytes += len(chunk)
+                    if copied_bytes > ctx.cfg["max_fetch_bytes"]:
+                        raise ValueError("result attachments exceed max_fetch_bytes")
+                    writer.write(chunk)
+                writer.flush()
+                os.fsync(writer.fileno())
+        else:
+            with open(src, "rb") as reader, private_open(dst) as writer:
+                shutil.copyfileobj(reader, writer)  # snapshot: hash stays valid even if the original changes
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        item = {"name": name, "size": dst.stat().st_size, "sha256": sha256_file(dst), "mime": mime,
+                "url": "http://%s:%d/f/%s/%s" % (me, int(ctx.cfg["port"]), token, urllib.parse.quote(name)),
+                "expires": expires}
+        if persistent_request:
+            del item["expires"]
+        meta["files"][name] = item
+        items.append(item)
+    if persistent_request:
+        sync_directory(d / "files")
+    (durable_write if persistent_request else atomic_write)(
+        d / "meta.json", json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
+    return items
+
+
+def prepare_pull_attachments(ctx, a, env):
+    """Snapshot the attachments in requests/sending/<id>, a new directory that is returned (None without files).
+    Any failure removes it again: no ledger row, printed ID or resume path refers to it yet."""
+    if a.ttl_hours is not None:
+        raise ValueError("pull requests use their request deadline for uploads; --ttl-hours is not supported")
+    if len(a.file) > 100:
+        raise ValueError("at most 100 request attachments are allowed")
+    directory = ctx.home / "requests" / "sending" / env["id"]
+    names, items, total = set(), [], 0
+    env["request"]["uploads"] = items
+    if not a.file:
+        return None
+    private_mkdir(directory.parent)
+    try:
+        directory.mkdir(mode=0o700)          # an exclusive claim: never adopt (or later remove) another attempt's
+    except FileExistsError:
+        raise ValueError("request attachment directory already exists: " + env["id"])
+    try:
+        for filename in a.file:
+            source = Path(filename)
+            if not source.is_file():
+                raise ValueError("not a file: " + str(filename))
+            name = safe_name(source.name)
+            while name in names:
+                name = "_" + name
+                if len(name) > 200:
+                    name = secrets.token_hex(4) + name[-192:]
+            names.add(name)
+            token = secrets.token_urlsafe(32)
+            target = directory / token
+            digest, size = hashlib.sha256(), 0
+            with open(source, "rb") as reader, private_open(target) as writer:
+                while True:
+                    chunk = reader.read(1 << 20)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if total + size > ctx.cfg["max_fetch_bytes"]:
+                        raise ValueError("request attachments exceed max_fetch_bytes")
+                    digest.update(chunk)
+                    writer.write(chunk)
+                writer.flush()
+                os.fsync(writer.fileno())
+            total += size
+            items.append({"token": token, "name": name, "sha256": digest.hexdigest(), "size": size,
+                          "mime": mimetypes.guess_type(name)[0] or "application/octet-stream"})
+        sync_directory(directory)
+    except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return directory
+
+
+def discard_unsaved_pull_snapshots(ctx, mid, staged, saving):
+    """Remove the new attachment snapshots of a pull request that was not saved. Before the save is attempted
+    nothing durable can refer to them. After a failed save, only a readable ledger without the outgoing row
+    proves that; a saved request keeps them for resume, and a missing or unreadable ledger keeps them too."""
+    if staged is None:
+        return
+    if saving:
+        try:
+            path = Path(ctx.home) / "requests" / "ledger.sqlite3"
+            db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            try:
+                saved = db.execute("SELECT 1 FROM requests WHERE direction='outgoing' AND id=?", (mid,)).fetchone()
+            finally:
+                db.close()
+        except Exception as exc:
+            log("kept request attachment snapshots; could not check the request ledger:", type(exc).__name__)
+            return
+        if saved:
+            return
+    shutil.rmtree(staged, ignore_errors=True)
+
+
+def upload_request_file(ctx, env, item, ip, port, peer):
+    source = ctx.home / "requests" / "sending" / env["id"] / item["token"]
+    if (not source.is_file() or source.is_symlink() or source.stat().st_size != item["size"] or
+            sha256_file(source) != item["sha256"]):
+        raise ValueError("saved request attachment is missing or changed: " + item["name"])
+    # Hashing a large snapshot takes time: check the pinned destination again right before connecting, so a
+    # private input never goes to whoever holds the address now.
+    verify_pull_destination(ctx, env, peer, ip)
+    connection = http.client.HTTPConnection(ip, port, timeout=30)
+    try:
+        with open(source, "rb") as stream:
+            connection.request("PUT", "/requests/%s/uploads/%s" % (env["id"], item["token"]), stream,
+                               headers={"Host": "%s:%d" % (peer, port), "Content-Type": "application/octet-stream",
+                                        "Content-Length": str(item["size"])})
+            response = connection.getresponse()
+            raw = response.read(64 * 1024)
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = None
+        if (response.status not in (200, 201) or not isinstance(body, dict) or body.get("ok") is not True or
+                body.get("id") != env["id"] or body.get("token") != item["token"] or
+                body.get("sha256") != item["sha256"] or body.get("size") != item["size"]):
+            raise RuntimeError("request attachment upload not confirmed (HTTP %s)" % response.status)
+    except (OSError, http.client.HTTPException) as exc:
+        raise TransportError(transport_diagnostic(peer, ip, port, "request attachment upload", exc)) from exc
+    finally:
+        connection.close()
+
+
+def verify_pull_destination(ctx, env, peer, ip):
+    """The destination pinned when the request was saved, checked again before each new connection: the
+    address must still belong to that stable Tailscale identity and local policy must still allow it, and
+    this machine must still be the request's sender. Each upload and the final commit opens a new
+    connection, and the identity behind the address can change between them."""
+    identity = fresh_whois(ctx, ip)
+    if not identity or identity.get("node") != peer or not ctx.access_decision(identity)[0]:
+        raise RuntimeError("request destination denied by local identity/access policy")
+    with request_db(ctx) as db:
+        saved = request_row(db, "outgoing", env["id"])
+        pinned = json.loads(saved["record"] or "{}").get("peer_identity") if saved else None
+    if pinned != peer_identity(identity):
+        raise RuntimeError("request destination stable identity changed")
+    if stable_peer_id(ctx.self_node().get("stable_id")) != env["from"]:
+        raise RuntimeError("request sender stable identity changed")
+
+
+def submit_pull_request(ctx, env, peer, ip, port):
+    verify_pull_destination(ctx, env, peer, ip)
+    try:
+        status, prepared = http_json(ip, port, "POST", "/requests/prepare", env, host=peer)
+        if (status not in (200, 201) or not isinstance(prepared, dict) or prepared.get("ok") is not True or
+                prepared.get("id") != env["id"]):
+            raise RuntimeError("request preparation not confirmed (HTTP %s): %s" %
+                               (status, prepared.get("error", "invalid response") if isinstance(prepared, dict) else "invalid response"))
+        if not prepared.get("committed"):
+            for item in env["request"].get("uploads", []):
+                upload_request_file(ctx, env, item, ip, port, peer)   # checks the destination before connecting
+        verify_pull_destination(ctx, env, peer, ip)
+        status, body = http_json(ip, port, "POST", "/msg", env, host=peer)
+    except (RuntimeError, OSError, ValueError) as exc:
+        with request_db(ctx) as db:
+            db.execute("UPDATE requests SET submission='unknown' WHERE direction='outgoing' AND id=?", (env["id"],))
+        raise RuntimeError("pull request %s remains resumable with `request resume %s`: %s" %
+                           (env["id"], env["id"], exc)) from exc
+    with request_db(ctx) as db:
+        accepted = status in (200, 202) and isinstance(body, dict) and body.get("ok") is True and body.get("id") == env["id"]
+        db.execute("UPDATE requests SET submission=? WHERE direction='outgoing' AND id=?",
+                   ("accepted" if accepted else "unknown" if status in (200, 202) else "rejected", env["id"]))
+    return status, body
+
+
 def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
     addr, addr_agent = split_addr(peer or a.peer)
     opt_agent = getattr(a, "agent", None)
@@ -1230,12 +3961,53 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
     for k, v in (("agent", agent), ("from_agent", from_agent)):
         if v is not None and agent_name_error(v):
             die("bad %s %r: %s" % (k, v, agent_name_error(v)))
-    me = ctx.self_node()["node"]
+    self_node = ctx.self_node()
+    me = self_node["node"]
     host, port = split_peer(addr, int(ctx.cfg["port"]))
     to_fqdn, to_ip = ctx.resolve(host)
+    tracked = a.kind == "request" and not getattr(a, "legacy_request", False)
+    if getattr(a, "client_ref", None) and not tracked:
+        die("--client-ref requires a tracked request")
+    pull = getattr(a, "transport", "push") == "pull"
+    if pull and not tracked:
+        die("--transport pull requires a tracked request; it cannot be combined with --legacy-request")
+    if tracked:
+        try:
+            status, info = http_json(to_ip, port, "GET", "/info", host=to_fqdn, timeout=5,
+                                     deadline=5, limit=64 * 1024)
+        except TransportError as exc:
+            die("request preflight transport failure; no request created: %s" % exc)
+        if status in (401, 403):
+            die("request preflight access denied (HTTP %d); check authenticated identity and receiver policy; no request created" % status)
+        if status == 503 and isinstance(info, dict) and info.get("code") in (
+                "identity_unavailable", "receiver_identity_unavailable", "receiver_identity_changed"):
+            die("request preflight %s; repair the receiver identity before retrying; no request created" % info["code"])
+        if status != 200:
+            die("request preflight HTTP %d from /info; receiver capability is unverified; no request created" % status)
+        if not isinstance(info, dict) or not isinstance(info.get("node"), str) or not info["node"]:
+            die("request preflight malformed /info response (missing node); no request created")
+        if info["node"] != to_fqdn:
+            die("request preflight receiver identity mismatch; /info does not match the resolved target; restart/reconcile the receiver; no request created")
+        if not isinstance(info.get("capabilities"), list) or not all(isinstance(c, str) for c in info["capabilities"]):
+            die("request preflight malformed /info capabilities; no request created")
+        if REQUEST_CAPABILITY not in info["capabilities"]:
+            die("peer does not advertise request-lifecycle-v1; upgrade it or explicitly use --legacy-request (no receipt/result guarantee)")
+        if pull and REQUEST_PULL_CAPABILITY not in info["capabilities"]:
+            die("peer does not advertise request-pull-v1; upgrade it before using --transport pull")
+        timeout_seconds = getattr(a, "timeout_seconds", 900)
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 604800:
+            die("--timeout-seconds must be 1..604800")
+    if pull:
+        me = stable_peer_id(self_node.get("stable_id"))
+        if not me:
+            die("Tailscale did not return this machine's StableID; pull requests cannot authenticate safely")
     msg_id = secrets.token_hex(8)  # hex: never starts with "-"
     env = {"v": VERSION, "id": msg_id, "from": me, "to": to_fqdn, "ts": iso(now_utc()),
            "kind": a.kind, "text": a.text}
+    if tracked:
+        env["request"] = {"timeout_seconds": timeout_seconds, "reply_port": int(ctx.cfg["port"])}
+        if pull:
+            env["request"]["transport"] = "pull"
     if reply_to or a.reply_to:
         env["reply_to"] = reply_to or a.reply_to
     if a.wake:  # omitted unless given, so receivers older than the wake field still accept it
@@ -1244,43 +4016,55 @@ def cmd_send(ctx, a, reply_to=None, peer=None, agent=None):
         env["agent"] = norm_agent(agent)
     if from_agent is not None:
         env["from_agent"] = norm_agent(from_agent)
-    if a.file:
-        ttl = a.ttl_hours if a.ttl_hours is not None else ctx.cfg["outbox_ttl_hours"]
-        expires = iso(now_utc() + dt.timedelta(seconds=int(ttl * 3600)))
-        token = secrets.token_urlsafe(32)
-        d = ctx.outbox / token
-        (d / "files").mkdir(parents=True)
-        meta = {"id": msg_id, "to": to_fqdn, "expires": expires, "files": {}}
-        items = []
-        for f in a.file:
-            src = Path(f)
-            if not src.is_file():
-                die("not a file: %s" % f)
-            name = safe_name(src.name)
-            while name in meta["files"]:
-                name = "_" + name
-            dst = d / "files" / name
-            shutil.copyfile(src, dst)  # snapshot: hash stays valid even if the original changes
-            mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
-            item = {"name": name, "size": dst.stat().st_size, "sha256": sha256_file(dst), "mime": mime,
-                    "url": "http://%s:%d/f/%s/%s" % (me, int(ctx.cfg["port"]), token, urllib.parse.quote(name)),
-                    "expires": expires}
-            meta["files"][name] = item
-            items.append(item)
-        atomic_write(d / "meta.json", json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"))
-        env["fetch"] = items
-    status, resp = http_json(to_ip, port, "POST", "/msg", env, host=to_fqdn)
-    if status == 400 and implicit_from and "from_agent" in env and "from_agent" in str(resp.get("error", "")):
+    staged, saving = None, False
+    if pull:
+        staged = prepare_pull_attachments(ctx, a, env)
+    else:
+        prepare_attachments(ctx, a, env, to_fqdn)
+    try:
+        error = validate_env(env)
+        if error:
+            die(error)
+        if tracked:
+            if staged is not None:
+                request_db(ctx).close()      # exists before the save, so a failed save can be told from a commit
+            saving = True
+            client_ref = getattr(a, "client_ref", None) or "client-" + msg_id
+            if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", client_ref):
+                die("--client-ref must contain 8..128 letters, digits, '_' or '-'")
+            save_outgoing_request(ctx, env, to_fqdn, port, client_ref)
+    except BaseException:
+        discard_unsaved_pull_snapshots(ctx, msg_id, staged, saving)
+        raise
+    try:
+        status, resp = submit_pull_request(ctx, env, to_fqdn, to_ip, port) if pull else \
+            http_json(to_ip, port, "POST", "/msg", env, host=to_fqdn)
+    except (RuntimeError, OSError):
+        if tracked:
+            with request_db(ctx) as db:
+                db.execute("UPDATE requests SET submission='unknown' WHERE direction='outgoing' AND id=?", (msg_id,))
+        raise
+    if tracked:
+        with request_db(ctx) as db:
+            db.execute("UPDATE requests SET submission=? WHERE direction='outgoing' AND id=?",
+                       ("accepted" if status in (200, 202) and isinstance(resp, dict) and resp.get("ok") is True and resp.get("id") == msg_id
+                        else "unknown" if status in (200, 202) else "rejected", msg_id))
+    if status == 400 and not tracked and implicit_from and "from_agent" in env and "from_agent" in str(resp.get("error", "")):
         # receiver predates @agent: from_agent only came from config, so drop it and resend (same id;
         # the rejected attempt was not stored). An explicit --agent / --as is never dropped silently.
         print("note: %s does not understand from_agent (old tailmsg); resent without it" % to_fqdn, file=sys.stderr)
         del env["from_agent"]
         status, resp = http_json(to_ip, port, "POST", "/msg", env, host=to_fqdn)
-    out = {"status": status, "response": resp, "id": msg_id, "to": to_fqdn, "files": len(env.get("fetch", []))}
+    out = {"status": status, "response": resp, "id": msg_id, "to": to_fqdn,
+           "files": len(env["request"].get("uploads", [])) if pull else len(env.get("fetch", []))}
+    if pull:
+        out["transport"] = "pull"
     if "agent" in env:
         out["agent"] = env["agent"]
+    if tracked:
+        out["submission"] = request_snapshot(ctx.home, msg_id, "outgoing")["submission"]
     print(json.dumps(out, ensure_ascii=True))
-    if status not in (200, 202):
+    if status not in (200, 202) or (tracked and out["submission"] != "accepted"):
         sys.exit(2)
 
 
@@ -1292,6 +4076,19 @@ def load_msg(ctx, mid):
     if not p.is_file():
         hits = [x for x in ctx.inbox.glob(mid + "*.json")]
         if len(hits) != 1:
+            ledger = ctx.home / "requests" / "ledger.sqlite3"
+            if ledger.is_file():
+                db = sqlite3.connect(ledger.resolve().as_uri() + "?mode=ro", uri=True)
+                db.row_factory = sqlite3.Row
+                try:
+                    rows = db.execute("SELECT e.* FROM response_events e WHERE substr(e.id,1,?)=?", (len(mid), mid)).fetchall()
+                finally:
+                    db.close()
+                if len(rows) == 1:
+                    env = json.loads(rows[0]["envelope"])
+                    return p, {"envelope": env, "received": {"at": rows[0]["received_at"],
+                        "peer": {"node": env["from"]}, "agent": env.get("agent"),
+                        "wake": {"requested": "none", "effective": "none", "reason": "protocol response"}}}
             die("no unique message matching %r" % mid)
         p = hits[0]
     return p, json.loads(p.read_text(encoding="utf-8"))
@@ -1319,13 +4116,27 @@ def cmd_inbox(ctx, a):
         if (r.get("received") or {}).get("agent_status") == "unknown":
             ag = "%s?" % ag
         e = r["envelope"]
-        nf = len(e.get("fetch", []))
-        got = sum((ctx.inbox / e["id"] / "files" / safe_name(f.get("name") or "file")).is_file() for f in e.get("fetch", []))
+        attachments = e["request"].get("uploads", []) if is_pull_request(e) else e.get("fetch", [])
+        nf = len(attachments)
+        got = sum((ctx.inbox / e["id"] / "files" / safe_name(f.get("name") or "file")).is_file() for f in attachments)
         wd = r.get("wake_delivery") or {}
         mark = ("" if acked else "*") + ("!" if wd and not wd.get("ok") else "")
         frm = e["from"].split(".")[0] + ("/" + e["from_agent"] if e.get("from_agent") else "")
+        if getattr(a, "json", False):
+            # the same rows as the table, unabridged where it truncates; text stays the sender's data
+            rows.append((r["received"]["at"], e["id"], {
+                "id": e["id"], "received_at": r["received"]["at"], "from": e["from"],
+                "from_agent": e.get("from_agent"), "agent": rec_agent(r, dflt),
+                "agent_known": (r.get("received") or {}).get("agent_status") != "unknown",
+                "kind": e.get("kind"), "tracked_request": "request" in e, "wake": w, "acked": acked,
+                "wake_failed": bool(wd) and not wd.get("ok"), "files": nf, "files_fetched": got,
+                "reply_to": e.get("reply_to"), "text_preview": (e.get("text") or "")[:INBOX_PREVIEW]}))
+            continue
         rows.append((r["received"]["at"], e["id"], frm, "@" + ag if ag else "-", w + mark, nf, got,
                      e.get("reply_to") or "", (e.get("text") or "").replace("\n", " ")[:60]))
+    if getattr(a, "json", False):
+        print(json.dumps([row[2] for row in sorted(rows, key=lambda row: row[:2])], ensure_ascii=True, indent=2))
+        return
     for at, mid, frm, ag, w, nf, got, rt, txt in sorted(rows):
         files = "%d/%d files" % (got, nf) if nf else ""
         local = parse_iso(at).astimezone().strftime("%m-%d %H:%M %Z")
@@ -1340,6 +4151,12 @@ def cmd_inbox(ctx, a):
 def cmd_ack(ctx, a):
     for mid in a.id:
         p, r = load_msg(ctx, mid)
+        if "response" in r["envelope"]:
+            die("protocol receipts/results are already recorded; ack is not applicable")
+        if "request" in r["envelope"]:
+            state = request_snapshot(ctx.home, r["envelope"]["id"])
+            if not state or state["last_state"] not in REQUEST_FINAL + ("timed_out",):
+                die("tracked request needs a durable final result before ack; use request respond or reply")
         if not r.get("acked_at"):
             r["acked_at"] = iso(now_utc())
             atomic_write(p, json.dumps(r, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -1349,6 +4166,8 @@ def cmd_ack(ctx, a):
 def cmd_wake(ctx, a):
     """re-run the wake adapter for a stored message (manual retry / adapter test), in the foreground."""
     p, r = load_msg(ctx, a.id)
+    if "response" in r["envelope"]:
+        die("protocol receipts/results must not wake an agent")
     agent = rec_agent(r, ctx.cfg.get("default_agent"))
     if not ctx.agent_adapter(agent):
         die("no wake adapter configured for @%s" % agent if agent is not None else "no wake_adapter configured")
@@ -1366,7 +4185,15 @@ def cmd_fetch(ctx, a):
     _, r = load_msg(ctx, a.id)
     env, sender = r["envelope"], r["received"]["peer"]["node"]
     out = ctx.inbox / env["id"] / "files"
-    out.mkdir(parents=True, exist_ok=True)
+    private_mkdir(out)
+    if is_pull_request(env):
+        for item in env["request"].get("uploads", []):
+            path = out / item["name"]
+            if (not path.is_file() or path.is_symlink() or path.stat().st_size != item["size"] or
+                    sha256_file(path) != item["sha256"]):
+                raise ValueError("received request attachment is missing or changed: " + item["name"])
+            print("OK    %s  %d bytes  sha256 verified -> %s" % (item["name"], item["size"], path))
+        return
     ok = True
     for f in env.get("fetch", []):
         name = safe_name(f.get("name") or Path(urllib.parse.urlparse(f["url"]).path).name)
@@ -1383,23 +4210,40 @@ def cmd_fetch(ctx, a):
             _, ip = ctx.resolve(u.hostname)
             if not is_tailnet_ip(ip):
                 raise RuntimeError("resolved to non-tailnet ip %s" % ip)
+            if env.get("response") and env.get("reply_to"):
+                with request_db(ctx) as db:
+                    original = request_row(db, "outgoing", env["reply_to"])
+                if original and is_pull_request(json.loads(original["envelope"])):
+                    ident = fresh_whois(ctx, ip)
+                    pinned = json.loads(original["record"] or "{}").get("peer_identity")
+                    if not ident or pinned != peer_identity(ident) or not ctx.access_decision(ident)[0]:
+                        raise RuntimeError("result attachment destination identity or authorization changed")
             c = http.client.HTTPConnection(ip, u.port or 80, timeout=30)
-            c.request("GET", u.path, headers={"Host": u.netloc})
-            resp = c.getresponse()
-            if resp.status != 200:
-                raise RuntimeError("HTTP %d %s" % (resp.status, resp.read(200).decode("utf-8", "replace")))
-            h, n = hashlib.sha256(), 0
-            part = dst.with_name(dst.name + ".part")
-            with open(part, "wb") as w:
-                while True:
-                    chunk = resp.read(1 << 20)
-                    if not chunk:
-                        break
-                    n += len(chunk)
-                    if n > f["size"]:
-                        break
-                    h.update(chunk)
-                    w.write(chunk)
+            try:
+                try:
+                    c.request("GET", u.path, headers={"Host": u.netloc})
+                    resp = c.getresponse()
+                    if resp.status != 200:
+                        raise RuntimeError("HTTP %d %s" % (resp.status, resp.read(200).decode("utf-8", "replace")))
+                except (OSError, http.client.HTTPException) as e:
+                    raise TransportError(transport_diagnostic(sender, ip, u.port or 80, "file fetch", e)) from e
+                h, n = hashlib.sha256(), 0
+                part = dst.with_name(dst.name + ".part")
+                with private_open(part, truncate=True) as w:
+                    while True:
+                        try:
+                            chunk = resp.read(1 << 20)
+                        except (OSError, http.client.HTTPException) as e:
+                            raise TransportError(transport_diagnostic(sender, ip, u.port or 80, "file fetch", e)) from e
+                        if not chunk:
+                            break
+                        n += len(chunk)
+                        if n > f["size"]:
+                            break
+                        h.update(chunk)
+                        w.write(chunk)
+            finally:
+                c.close()
             if n != f["size"] or h.hexdigest() != f["sha256"]:
                 part.unlink()
                 raise RuntimeError("sha256/size mismatch - discarded")
@@ -1412,11 +4256,236 @@ def cmd_fetch(ctx, a):
         sys.exit(2)
 
 
+def staged_result_referenced(ctx, request_id, token, since_seq=None):
+    """Whether a durable response of this incoming request may refer to the staged outbox token. The ledger is
+    opened read-only and nothing is created. Only a readable ledger with the original request's row, whose
+    responses all parse and name other copies, proves the copy unused; anything else counts as referenced.
+    since_seq is the response sequence seen before staging: any response committed since then may have been
+    this attempt's, published and already replaced as latest (pull responses keep no other record)."""
+    path = Path(ctx.home) / "requests" / "ledger.sqlite3"
+    if not path.is_file():
+        return True
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        row = db.execute("SELECT latest,seq FROM requests WHERE direction='incoming' AND id=?",
+                         (request_id,)).fetchone()
+        if row is None or (since_seq is not None and row[1] != since_seq):
+            return True
+        packed = ([row[0]] if row[0] else []) + [r[0] for r in db.execute(
+            "SELECT envelope FROM response_outbox WHERE request_id=?", (request_id,))]
+    finally:
+        db.close()
+    marker = "/f/%s/" % token
+    for value in packed:
+        try:
+            fetch = json.loads(value).get("fetch", [])
+            urls = [item["url"] for item in fetch]
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return True
+        if any(not isinstance(url, str) or marker in url for url in urls):
+            return True
+    return False
+
+
+def discard_unreferenced_staging(ctx, request_id, staged, since_seq=None):
+    """Remove the copy this attempt staged, but only once the ledger proves that no durable response refers to
+    it. A missing, unreadable or malformed ledger keeps the copy: a response may already refer to it."""
+    if staged is None:
+        return
+    try:
+        if staged_result_referenced(ctx, request_id, staged.name, since_seq):
+            return
+    except Exception as exc:
+        log("kept staged result files; could not check the request ledger:", type(exc).__name__)
+        return
+    shutil.rmtree(staged, ignore_errors=True)
+
+
+def respond_with_files(ctx, rec, a, state):
+    original = rec["envelope"]
+    snapshot = request_snapshot(ctx.home, original["id"])
+    if not snapshot:
+        raise ValueError("no tracked incoming request with this ID")
+    envelope = {"id": original["id"], "from": snapshot["response"]["from"]}
+    staged = prepare_attachments(ctx, a, envelope, rec["received"]["peer"]["node"],
+                                 persistent_request=original["id"] if is_pull_request(original) else None)
+    try:
+        result = respond_request(ctx, original["id"], state, a.text, envelope.get("fetch"))
+    except BaseException:
+        # A refused or failed response leaves this copy unreferenced, unless the failure came after the durable
+        # commit: the ledger decides, not the exception. Once any response was committed after the snapshot, a
+        # requester may already have this copy's URLs although a later response replaced them as latest.
+        discard_unreferenced_staging(ctx, original["id"], staged, since_seq=snapshot["seq"])
+        raise
+    if result.get("fetch") != envelope.get("fetch"):
+        # An identical retry returned the stored response, which keeps its own copy and URLs.
+        discard_unreferenced_staging(ctx, original["id"], staged)
+    return result
+
+
 def cmd_reply(ctx, a):
     _, r = load_msg(ctx, a.id)
+    if "response" in r["envelope"]:
+        die("protocol receipts/results do not accept replies; send a new request if needed")
+    if "request" in r["envelope"]:
+        if getattr(a, "agent", None) or getattr(a, "as_agent", None) or a.port:
+            die("tracked reply uses original authenticated sender and agent routing; route overrides are not allowed")
+        result = respond_with_files(ctx, r, a, "completed")
+        detail = {"stored": True, "transport": "pull"} if is_pull_request(r["envelope"]) else {"queued": True}
+        print(json.dumps(dict(detail, id=r["envelope"]["id"], response_id=result["id"], state="completed")))
+        return
     # route back to the sender's agent (from_agent) unless --agent overrides
     cmd_send(ctx, a, reply_to=r["envelope"]["id"], peer=r["received"]["peer"]["node"] +
              (":%d" % a.port if a.port else ""), agent=r["envelope"].get("from_agent"))
+
+
+def cmd_request(ctx, a):
+    if a.request_cmd == "send":
+        a.kind, a.reply_to = "request", None
+        return cmd_send(ctx, a)
+    if a.request_cmd == "resume":
+        if not ID_RE.fullmatch(a.id):
+            die("bad request id")
+        with request_db(ctx) as db:
+            row = request_row(db, "outgoing", a.id)
+            if not row:
+                die("no outgoing request with this ID")
+            env, peer, port = json.loads(row["envelope"]), row["peer"], row["port"]
+        if not is_pull_request(env):
+            die("request resume is only supported for pull requests")
+        resolved, ip = ctx.resolve(peer)
+        if resolved != peer:
+            die("request destination identity changed")
+        status, response = submit_pull_request(ctx, env, peer, ip, port)
+        snapshot = request_snapshot(ctx.home, a.id, "outgoing")
+        print(json.dumps({"id": a.id, "status": status, "response": response,
+                          "submission": snapshot["submission"], "transport": "pull"}))
+        if snapshot["submission"] != "accepted":
+            sys.exit(2)
+        return
+    if a.request_cmd == "respond":
+        _, rec = load_msg(ctx, a.id)
+        mid = rec["envelope"]["id"]
+        result = respond_with_files(ctx, rec, a, a.state)
+        detail = {"stored": True, "transport": "pull"} if is_pull_request(rec["envelope"]) else {"queued": True}
+        print(json.dumps(dict(detail, id=mid, response_id=result["id"], state=a.state)))
+        return
+    if a.request_cmd == "resolve":
+        result = resolve_task(ctx, a.task_id, a.by, a.note, getattr(a, "generation", None))
+        print(json.dumps(result, ensure_ascii=True) if a.json else
+              "%s resolution=%s attention=%s" % (result["task_id"], result["resolution"], result["attention"]))
+        return
+    if a.request_cmd == "authorize":
+        try:
+            scope = json.loads(a.scope_json)
+        except (TypeError, ValueError):
+            die("--scope-json must be valid JSON")
+        result = authorize_task(ctx, a.task_id, scope, target_agent=a.target_agent, target_host=a.target_host,
+                                expires_seconds=a.expires_seconds, expected_generation=a.generation)
+        print(json.dumps(result, ensure_ascii=True) if a.json else
+              "%s task=%s generation=%s expires=%s" % (result["authorization_id"], result["task_id"],
+                                                        result["generation"], result["expires_at"]))
+        return
+    if a.request_cmd == "authorize-attempt":
+        try:
+            scope = json.loads(a.scope_json)
+        except (TypeError, ValueError):
+            die("--scope-json must be valid JSON")
+        result = authorize_and_create_task_attempt(
+            ctx, a.task_id, scope, target_agent=a.target_agent, target_host=a.target_host,
+            expires_seconds=a.expires_seconds, expected_generation=a.generation,
+            operation_key=a.operation_key or getattr(a, "client_ref", None),
+            operation_digest=a.operation_digest, action=a.action)
+        print(json.dumps(result, ensure_ascii=True) if a.json else
+              "%s task=%s generation=%s state=%s" % (result["attempt_id"], result["task_id"],
+                                                       result["generation"], result["state"]))
+        return
+    if a.request_cmd == "attempt":
+        result = create_task_attempt(ctx, a.task_id, a.authorization_id, expected_generation=a.generation,
+                                     operation_key=a.operation_key or getattr(a, "client_ref", None), operation_digest=a.operation_digest,
+                                     action=a.action, target_agent=a.target_agent, target_host=a.target_host)
+        print(json.dumps(result, ensure_ascii=True) if a.json else
+              "%s task=%s generation=%s state=%s%s" % (result["attempt_id"], result["task_id"],
+                                                       result["generation"], result["state"],
+                                                       " (idempotent)" if result.get("idempotent") else ""))
+        return
+    if a.request_cmd == "revoke":
+        result = revoke_task_authorization(ctx, a.authorization_id, getattr(a, "generation", None), a.by)
+        print(json.dumps(result, ensure_ascii=True) if a.json else
+              "%s task=%s status=%s generation=%s" % (result["authorization_id"], result["task_id"],
+                                                       result["status"], result["generation"]))
+        return
+    if a.request_cmd in ("task", "task-status"):
+        output = next((item for item in task_snapshots(ctx.home) if item["task_id"] == a.task_id), None)
+        if not output:
+            die("no task with this ID")
+        print(json.dumps(output, ensure_ascii=True, indent=2) if a.json else
+              "%s latest=%s state=%s resolution=%s attention=%s generation=%s attempts=%s" %
+              (output["task_id"], output["latest_request_id"], output["latest_state"], output["resolution"],
+               output["attention"], output["generation"], output["attempt_count"]))
+        return
+    if a.request_cmd == "maintain":
+        phases = request_maintenance(ctx)
+        failed = sorted(name for name, outcome in phases.items() if outcome.startswith("failed"))
+        # busy: the receiver (or another maintain) is delivering responses right now; nothing was sent twice.
+        print(json.dumps({"ok": not failed, "complete": all(o == "ok" for o in phases.values()), "phases": phases}))
+        if failed:
+            sys.exit(1)
+        return
+    if a.request_cmd == "list":
+        output = task_snapshots(ctx.home, a.open) if a.open else request_snapshots(ctx.home)
+    else:
+        output = request_snapshot(ctx.home, a.id, a.direction)
+        if not output:
+            die("no tracked %s request with this ID" % a.direction)
+    if a.request_cmd == "status" and a.refresh:
+        if a.direction != "outgoing":
+            die("--refresh is only for outgoing requests")
+        try:
+            peer, ip = ctx.resolve(output["peer"])
+            if peer != output["peer"]:
+                raise RuntimeError("request destination identity changed")
+            identity = fresh_whois(ctx, ip) if output.get("transport") == "pull" else ctx.whois(ip)
+            if not identity or identity.get("node") != peer or not ctx.access_decision(identity)[0]:
+                raise RuntimeError("request destination denied by local identity/access policy")
+            if output.get("transport") == "pull":
+                with request_db(ctx) as db:
+                    row = request_row(db, "outgoing", a.id)
+                    pinned = json.loads(row["record"] or "{}").get("peer_identity")
+                if pinned != peer_identity(identity):
+                    raise RuntimeError("request destination stable identity changed")
+            status, body = http_json(ip, output["port"], "GET", "/requests/" + a.id, host=peer, timeout=5)
+            if status != 200 or not isinstance(body, dict):
+                raise RuntimeError("receiver status unavailable (HTTP %s); outcome remains unknown" % status)
+            remote_request = body.get("request")
+            result = remote_request.get("response") if isinstance(remote_request, dict) else None
+            if not isinstance(result, dict) or result.get("reply_to") != a.id:
+                raise RuntimeError("receiver returned no matching request response")
+            accept_response(ctx, result, peer)
+            with request_db(ctx) as db:
+                row = request_row(db, "outgoing", a.id)
+                output = request_view(row, task_projection(db, "outgoing", a.id, row))
+            output["refresh"] = "ok"
+        except (RuntimeError, OSError, ValueError) as exc:
+            output["refresh"] = "unavailable"
+            output["refresh_error"] = str(exc)
+    if a.json:
+        print(json.dumps(output, ensure_ascii=True, indent=2))
+    else:
+        for item in output if isinstance(output, list) else [output]:
+            if a.request_cmd == "list" and a.open:
+                print("%s latest=%s state=%s resolution=%s attention=%s peer=%s attempts=%s" %
+                      (item["task_id"], item["latest_request_id"], item["latest_state"], item["resolution"],
+                       item["attention"], item["peer"], item["attempt_count"]))
+                continue
+            print("%s %s %s state=%s deadline=%s outcome=%s task=%s resolution=%s attention=%s%s" %
+                  (item["id"], item["direction"], item["peer"], item["state"], item["deadline"],
+                   "known" if item["outcome_known"] else "unknown", item.get("task_id"),
+                   item.get("resolution"), item.get("attention"), " (late result)" if item["late"] else ""))
+            if item.get("response"):
+                print(item["response"]["text"])
+            if item.get("refresh_error"):
+                print(item["refresh_error"])
 
 
 def cmd_peers(ctx, a):
@@ -1428,8 +4497,10 @@ def cmd_peers(ctx, a):
     def probe(n):
         ip = (n.get("TailscaleIPs") or ["?"])[0]
         try:
-            s, j = http_json(ip, port, "GET", "/health", timeout=3)
+            s, j = http_json(ip, port, "GET", "/health", host=(n.get("DNSName") or ip).rstrip("."), timeout=3)
             res[ip] = "yes (v%s)" % j.get("v") if s == 200 else "HTTP %d" % s
+        except TransportError as e:
+            res[ip] = "no response: %s" % e
         except Exception:
             res[ip] = "no"
     ths = [threading.Thread(target=probe, args=(n,)) for n in peers if n.get("Online")]
@@ -1468,9 +4539,95 @@ def main():
                        help="my agent name, sent as from_agent (default: config self_agent; omitted if unset)")
         if name == "send":
             p.add_argument("--reply-to")
+            p.add_argument("--timeout-seconds", type=int, default=900)
+            p.add_argument("--client-ref", help="local stable reference for the long-lived task")
+            p.add_argument("--legacy-request", action="store_true", help="opt out of request lifecycle for an old peer")
+            p.add_argument("--transport", choices=("push", "pull"), default="push")
+    pr = sp.add_parser("request", help="tracked requests, receipts, results and timeout status")
+    rs = pr.add_subparsers(dest="request_cmd", required=True)
+    rq = rs.add_parser("send")
+    rq.add_argument("peer")
+    rq.add_argument("text")
+    rq.add_argument("--timeout-seconds", type=int, default=900)
+    rq.add_argument("--client-ref", help="local stable reference for the long-lived task")
+    rq.add_argument("--legacy-request", action="store_true")
+    rq.add_argument("--transport", choices=("push", "pull"), default="push",
+                    help="pull sends files and polls results without any reverse connections")
+    rq.add_argument("--file", action="append", default=[])
+    rq.add_argument("--ttl-hours", type=float)
+    rq.add_argument("--wake", choices=WAKE_LEVELS)
+    rq.add_argument("--agent")
+    rq.add_argument("--as", dest="as_agent")
+    rs.add_parser("resume", help="retry the same saved pull request and immutable attachments").add_argument("id")
+    rq = rs.add_parser("status")
+    rq.add_argument("id")
+    rq.add_argument("--direction", choices=("incoming", "outgoing"), default="outgoing")
+    rq.add_argument("--refresh", action="store_true")
+    rq.add_argument("--json", action="store_true")
+    rq = rs.add_parser("list")
+    rq.add_argument("--open", action="store_true", help="only unresolved long-lived tasks")
+    rq.add_argument("--json", action="store_true")
+    rq = rs.add_parser("resolve", help="explicitly close a long-lived task without changing its request attempt")
+    rq.add_argument("task_id")
+    rq.add_argument("--by", default="local-user", help="trusted local disposition owner")
+    rq.add_argument("--note")
+    rq.add_argument("--generation", type=int, help="expected task control generation")
+    rq.add_argument("--json", action="store_true")
+    rq = rs.add_parser("authorize", help="record a trusted local authorization for a task")
+    rq.add_argument("task_id")
+    rq.add_argument("--scope-json", required=True)
+    rq.add_argument("--target-agent")
+    rq.add_argument("--target-host")
+    rq.add_argument("--expires-seconds", type=int, default=3600)
+    rq.add_argument("--generation", type=int)
+    rq.add_argument("--json", action="store_true")
+    rq = rs.add_parser("attempt", help="create a new internal attempt under an authorized task")
+    rq.add_argument("task_id")
+    rq.add_argument("--authorization", dest="authorization_id", required=True)
+    rq.add_argument("--generation", type=int)
+    rq.add_argument("--operation-key")
+    rq.add_argument("--client-ref", help="stable idempotency key for this internal operation")
+    rq.add_argument("--operation-digest")
+    rq.add_argument("--action")
+    rq.add_argument("--target-agent")
+    rq.add_argument("--target-host")
+    rq.add_argument("--json", action="store_true")
+    rq = rs.add_parser("authorize-attempt", help="atomically authorize a task and create its first attempt")
+    rq.add_argument("task_id")
+    rq.add_argument("--scope-json", required=True)
+    rq.add_argument("--target-agent")
+    rq.add_argument("--target-host")
+    rq.add_argument("--expires-seconds", type=int, default=3600)
+    rq.add_argument("--generation", type=int)
+    rq.add_argument("--operation-key")
+    rq.add_argument("--client-ref")
+    rq.add_argument("--operation-digest")
+    rq.add_argument("--action")
+    rq.add_argument("--json", action="store_true")
+    rq = rs.add_parser("revoke", help="revoke a trusted local task authorization")
+    rq.add_argument("authorization_id")
+    rq.add_argument("--generation", type=int)
+    rq.add_argument("--by", default="local-user")
+    rq.add_argument("--json", action="store_true")
+    rq = rs.add_parser("task", help="show a long-lived task projection")
+    rq.add_argument("task_id")
+    rq.add_argument("--json", action="store_true")
+    rq = rs.add_parser("task-status", help="alias for task")
+    rq.add_argument("task_id")
+    rq.add_argument("--json", action="store_true")
+    rq = rs.add_parser("respond")
+    rq.add_argument("id")
+    rq.add_argument("text")
+    rq.add_argument("--state", choices=("running",) + REQUEST_FINAL, default="completed")
+    rq.add_argument("--file", action="append", default=[])
+    rq.add_argument("--ttl-hours", type=float)
+    rs.add_parser("maintain", help="one pass: inbox recovery, request expiry and response delivery "
+                                   "(each attempted; delivery reports busy while the receiver delivers)")
     pi = sp.add_parser("inbox", help="list received messages")
     pi.add_argument("--pending", action="store_true", help="only un-acked messages with effective wake now/batch")
     pi.add_argument("--agent", help="only messages for this agent (no `agent` in message = default_agent)")
+    pi.add_argument("--json", action="store_true", help="one JSON array, oldest first (text cut to %d characters)"
+                    % INBOX_PREVIEW)
     sp.add_parser("ack", help="mark message(s) as processed").add_argument("id", nargs="+")
     for name in ("show", "fetch"):
         sp.add_parser(name).add_argument("id")
@@ -1480,10 +4637,14 @@ def main():
     if a.cmd == "reply":
         a.reply_to = None
     try:
-        ctx = Ctx(a.home)
+        if a.cmd == "request" and a.request_cmd in ("status", "list", "task", "task-status") and not getattr(a, "refresh", False):
+            ctx = object.__new__(Ctx)
+            ctx.home = Path(a.home).expanduser()
+        else:
+            ctx = Ctx(a.home)
         {"serve": cmd_serve, "send": cmd_send, "reply": cmd_reply, "inbox": cmd_inbox, "show": cmd_show,
-         "fetch": cmd_fetch, "peers": cmd_peers, "ack": cmd_ack, "wake": cmd_wake}[a.cmd](ctx, a)
-    except (RuntimeError, OSError, AdapterError) as e:
+         "fetch": cmd_fetch, "peers": cmd_peers, "ack": cmd_ack, "wake": cmd_wake, "request": cmd_request}[a.cmd](ctx, a)
+    except (RuntimeError, OSError, AdapterError, ValueError) as e:
         die(str(e))
 
 

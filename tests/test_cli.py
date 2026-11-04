@@ -15,6 +15,7 @@ from pathlib import Path
 from support.pkg import REPO, Package, free_port, snapshot
 
 PKG = None
+FALSE = shutil.which("false") or "/bin/false"  # wake-config checks the path; macOS only has /usr/bin/false
 
 
 def setUpModule():
@@ -48,10 +49,11 @@ class LocateTests(Base):
     def test_paths_resolve_inside_the_unpacked_archive(self):
         r, d = PKG.run_json(["paths"], self.user)
         self.assertEqual(0, r.returncode)
-        self.assertEqual(str(PKG.plugin), d["plugin_root"])
+        # The launcher reports its own resolved location: on macOS the temporary /var/... is /private/var/...
+        self.assertEqual(os.path.realpath(str(PKG.plugin)), d["plugin_root"])
         self.assertTrue(" " in d["plugin_root"])
         self.assertFalse(d["plugin_root"].startswith(str(REPO)))
-        self.assertEqual(str(PKG.core), d["core"])
+        self.assertEqual(os.path.realpath(str(PKG.core)), d["core"])
         self.assertEqual(str(self.home), d["home"])
         self.assertEqual("default", d["home_source"])
         self.assertFalse(d["config_exists"])
@@ -63,7 +65,7 @@ class LocateTests(Base):
         if not link.exists():
             os.symlink(str(PKG.launcher), str(link))
         r, d = PKG.run_json(["paths"], self.user, launcher=link, cwd=PKG.root / "Plugin Cache")
-        self.assertEqual(str(PKG.plugin), d["plugin_root"])
+        self.assertEqual(os.path.realpath(str(PKG.plugin)), d["plugin_root"])
 
     def test_python_entry_point_and_home_selection(self):
         import subprocess
@@ -94,13 +96,25 @@ class LocateTests(Base):
 
 
 class ReadOnlyTests(Base):
+    def test_packaged_request_queries_need_no_network_and_create_no_ledger(self):
+        self.write_config({})
+        plugin_before, user_before = snapshot(PKG.plugin), snapshot(self.user, ignore_macos_caches=True)
+        r = self.yobiru("request", "list", "--json")
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertEqual([], json.loads(r.stdout))
+        r = self.yobiru("request", "status", "0011223344556677", "--json")
+        self.assertNotEqual(0, r.returncode)
+        self.assertIn("no tracked outgoing request", r.stderr)
+        self.assertEqual(user_before, snapshot(self.user, ignore_macos_caches=True))
+        self.assertEqual(plugin_before, snapshot(PKG.plugin))
+
     def test_install_and_read_only_commands_create_nothing(self):
-        plugin_before, user_before = snapshot(PKG.plugin), snapshot(self.user)
+        plugin_before, user_before = snapshot(PKG.plugin), snapshot(self.user, ignore_macos_caches=True)
         state = PKG.fake_state("ro", calls=str(PKG.root / "ro-calls.log"))
         for args in (["paths"], ["--help"], ["version"], ["status"], ["status", "--json"], ["doctor"],
                      ["doctor", "--json"], ["service-template", "systemd"], ["codex-bridge", "status"]):
             self.yobiru(*args, tailscale=True, extra={"FAKE_TS_STATE": str(state)})
-        self.assertEqual(user_before, snapshot(self.user))
+        self.assertEqual(user_before, snapshot(self.user, ignore_macos_caches=True))
         self.assertEqual(plugin_before, snapshot(PKG.plugin))      # no __pycache__ or state in the plugin
         calls = [json.loads(x) for x in (PKG.root / "ro-calls.log").read_text().splitlines()]
         self.assertTrue(calls)
@@ -262,14 +276,14 @@ class WakeConfigTests(Base):
     def test_inherited_top_level_adapter_is_not_replaced_silently(self):
         path = self.write_config({"allow": ["peer"], "default_agent": "codex", "on_message": ["/bin/true"]})
         before = path.read_bytes()
-        r = self.yobiru("wake-config", "--agent", "codex", "--exec", "/bin/false", "--apply")
+        r = self.yobiru("wake-config", "--agent", "codex", "--exec", FALSE, "--apply")
         self.assertEqual(1, r.returncode)
         self.assertIn("inherited top-level", r.stdout)
         self.assertEqual(before, path.read_bytes())
-        r = self.yobiru("wake-config", "--agent", "codex", "--exec", "/bin/false", "--replace", "--apply")
+        r = self.yobiru("wake-config", "--agent", "codex", "--exec", FALSE, "--replace", "--apply")
         self.assertEqual(0, r.returncode, r.stdout)
         cfg = self.config()
-        self.assertEqual({"type": "exec", "argv": ["/bin/false"]}, cfg["agents"]["codex"]["wake_adapter"])
+        self.assertEqual({"type": "exec", "argv": [FALSE]}, cfg["agents"]["codex"]["wake_adapter"])
         self.assertEqual(["/bin/true"], cfg["on_message"])
 
     def test_own_adapter_and_cap_on_an_nfc_equivalent_key_need_replace(self):
@@ -277,15 +291,15 @@ class WakeConfigTests(Base):
         path = self.write_config({"allow": ["peer"], "agents": {decomposed: {
             "wake_adapter": {"type": "exec", "argv": ["/bin/true"]}, "wake_max": "batch"}}})
         before = path.read_bytes()
-        r = self.yobiru("wake-config", "--agent", "café", "--exec", "/bin/false", "--wake-max", "now", "--apply")
+        r = self.yobiru("wake-config", "--agent", "café", "--exec", FALSE, "--wake-max", "now", "--apply")
         self.assertEqual(1, r.returncode)
         self.assertEqual(before, path.read_bytes())
-        r = self.yobiru("wake-config", "--agent", "café", "--exec", "/bin/false", "--wake-max", "now",
+        r = self.yobiru("wake-config", "--agent", "café", "--exec", FALSE, "--wake-max", "now",
                         "--replace", "--apply")
         self.assertEqual(0, r.returncode, r.stdout)
         agents = self.config()["agents"]
         self.assertEqual([decomposed], list(agents))
-        self.assertEqual({"wake_adapter": {"type": "exec", "argv": ["/bin/false"]}, "wake_max": "now"}, agents[decomposed])
+        self.assertEqual({"wake_adapter": {"type": "exec", "argv": [FALSE]}, "wake_max": "now"}, agents[decomposed])
 
     def test_remove_adapter_reports_the_real_fallback(self):
         self.write_config({"allow": ["peer"], "default_agent": "codex",
@@ -334,16 +348,73 @@ class RuntimeAndServiceTests(Base):
         self.assertEqual(PKG.core.read_bytes(), target.read_bytes())
         self.assertEqual("# a different running receiver\n", Path(res["backup"]).read_text())
 
+    def test_install_runtime_keeps_a_newer_runtime_unless_a_downgrade_is_allowed(self):
+        """A development or later runtime (by SemVer) is never replaced by an older bundled copy by --upgrade
+        alone: a beta plugin installed next to a development receiver must not silently downgrade it."""
+        self.write_config({"allow": ["peer"]})
+        target = self.home / "tailmsg.py"
+        newer = 'PRODUCT_VERSION = "99.0.0-dev.1"\n# a development runtime with its own features\n'
+        target.write_text(newer)
+        r, res = PKG.run_json(["install-runtime", "--upgrade", "--apply", "--json"], self.user)
+        self.assertEqual((1, "refused", False), (r.returncode, res["action"], res["written"]))
+        self.assertEqual(("99.0.0-dev.1", PKG.product["version"]), (res["existing_version"], res["bundled_version"]))
+        self.assertIn("--allow-downgrade", res["error"])
+        self.assertEqual(newer, target.read_text())
+        self.assertEqual([], sorted(p.name for p in self.home.glob("tailmsg.py.bak-*")), "nothing was written")
+        r, res = PKG.run_json(["install-runtime", "--upgrade", "--allow-downgrade", "--apply", "--json"], self.user)
+        self.assertEqual((0, "upgrade", True), (r.returncode, res["action"], res["written"]))
+        self.assertEqual(PKG.core.read_bytes(), target.read_bytes())
+        self.assertEqual(newer, Path(res["backup"]).read_text(), "the newer runtime is kept as the backup")
+        target.write_text('PRODUCT_VERSION = "0.0.1"\n')                     # an older runtime needs no flag
+        r, res = PKG.run_json(["install-runtime", "--upgrade", "--apply", "--json"], self.user)
+        self.assertEqual((0, "upgrade", "0.0.1"), (r.returncode, res["action"], res["existing_version"]))
+
     def test_launchd_template_is_a_valid_plist(self):
         home = self.user / "data home"
         r = self.yobiru("--home", str(home), "service-template", "launchd")
         self.assertEqual(0, r.returncode)
         plist = plistlib.loads(r.stdout.encode("utf-8"))
         self.assertEqual("dev.tailmsg", plist["Label"])
-        self.assertEqual([os.path.realpath(sys.executable), str(home / "tailmsg.py"), "--home", str(home), "serve"],
-                         plist["ProgramArguments"])
+        self.assertTrue(os.path.samefile(sys.executable, plist["ProgramArguments"][0]))
+        self.assertEqual([str(home / "tailmsg.py"), "--home", str(home), "serve"],
+                         plist["ProgramArguments"][1:])
         self.assertIn("install-runtime", r.stderr)
         self.assertIn("LaunchAgents", r.stderr)
+        self.assertNotIn("EnvironmentVariables", plist, "no tailscale on PATH here: nothing to add")
+
+    def test_launchd_template_adds_the_tailscale_directory_to_path(self):
+        # launchd runs jobs with PATH=/usr/bin:/bin:/usr/sbin:/sbin; a bare `tailscale` found elsewhere
+        # (the standalone macOS app installs /usr/local/bin/tailscale) must stay reachable from the service.
+        r = self.yobiru("service-template", "launchd", tailscale=True)
+        self.assertEqual(0, r.returncode, r.stderr)
+        env = plistlib.loads(r.stdout.encode("utf-8"))["EnvironmentVariables"]
+        self.assertEqual("/usr/bin:/bin:/usr/sbin:/sbin:" + str(PKG.fakebin), env["PATH"])
+        self.write_config({"tailscale_cmd": ["/Applications/Tailscale.app/Contents/MacOS/Tailscale"]})
+        r = self.yobiru("service-template", "launchd", tailscale=True)
+        self.assertNotIn("EnvironmentVariables", plistlib.loads(r.stdout.encode("utf-8")),
+                         "an absolute tailscale_cmd needs no PATH")
+
+    def test_launchd_template_keeps_a_custom_tailscale_command_runnable(self):
+        directory = self.user / "custom CLI"
+        directory.mkdir()
+        command = directory / "configured-tailscale"
+        shutil.copyfile(str(PKG.fakebin / "tailscale"), str(command))
+        command.chmod(0o755)
+        state = PKG.fake_state("launchd-custom", ip4="127.0.0.42")
+        argv = [command.name, "--state", str(state)]
+        self.write_config({"tailscale_cmd": argv})
+        before = snapshot(self.home)
+        r = self.yobiru("service-template", "launchd", extra={
+            "PATH": str(PKG.bin) + os.pathsep + str(directory) + os.pathsep + str(PKG.fakebin)})
+        self.assertEqual(0, r.returncode, r.stderr)
+        env = plistlib.loads(r.stdout.encode("utf-8"))["EnvironmentVariables"]
+        self.assertEqual("/usr/bin:/bin:/usr/sbin:/sbin:" + str(directory), env["PATH"])
+        self.assertEqual(before, snapshot(self.home), "template generation must stay read-only")
+        # Exercise subprocess lookup using just the saved service environment, without the interactive PATH.
+        result = subprocess.run(argv + ["ip", "-4"], env=dict(env, HOME=str(self.user)), cwd=str(PKG.work),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("127.0.0.42", result.stdout.strip())
 
     def test_systemd_template_quotes_paths(self):
         home = self.user / "100% data $HOME"
@@ -458,6 +529,10 @@ class LinuxCodexBridgeTests(Base):
         r, res = PKG.run_json(["--home", str(self.home), "codex-bridge", "status"], self.user, extra=self.extra)
         self.assertEqual(("unix_socket", "listening", True, False),
                          (res["transport"], res["socket"], res["codex_path_ok"], res["allow_replies"]))
+        # A files-only install is not an active bridge: no daemon heartbeat, so nothing is reported healthy.
+        self.assertEqual("unix_socket", res["diagnostics"]["capabilities"]["transport"])
+        self.assertIn("daemon_not_confirmed", res["diagnostics"]["reasons"])
+        self.assertTrue(any("daemon" in hint for hint in res["hints"]))
         self.listener.close()
         r, res = PKG.run_json(["--home", str(self.home), "codex-bridge", "status"], self.user, extra=self.extra)
         self.assertEqual("socket_stale", res["socket"])

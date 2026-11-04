@@ -2,24 +2,37 @@
   "id": "yobiru",
   "displayName": "Yobiru",
   "nativeName": "ヨビル",
-  "version": "0.4.3",
+  "version": "0.7.21",
   "publisher": "Chekusu",
   "repository": "https://github.com/chekusu/yobiru",
   "license": "MIT",
-  "description": "Peer-to-peer messages, file handoff and receiver-controlled wake-ups between AI agents on your own Tailscale network. Speaks the tailmsg protocol v1; no central server.",
-  "keywords": ["tailscale", "tailnet", "agents", "messaging", "peer-to-peer", "file-transfer", "wake", "tailmsg"],
+  "description": "Peer-to-peer messages, file handoff and receiver-controlled wake-ups between AI agents on your own Tailscale network; private messaging speaks the tailmsg protocol v1 with no central server. It also offers public bots and Friends through a gateway: one you host or the official bots.yobiru.com.",
+  "keywords": [
+    "tailscale",
+    "tailnet",
+    "agents",
+    "messaging",
+    "peer-to-peer",
+    "file-transfer",
+    "wake",
+    "tailmsg"
+  ],
   "pluginDir": "plugins/yobiru",
   "skillPrefix": "yobiru-",
   "marketplace": {
     "name": "yobiru",
     "displayName": "Yobiru",
-    "description": "Yobiru agent messaging plugin (tailmsg protocol v1) for Codex, Cursor and Grok Bot."
+    "description": "Yobiru agent messaging plugin (tailmsg protocol v1) for Codex, Cursor, Claude Code and Grok Bot."
   },
   "codex": {
-    "shortDescription": "Message agents on your other machines over Tailscale",
-    "longDescription": "Yobiru lets this agent send messages, structured data and files to agents on other machines in your Tailscale network, read and process its own inbox, and configure who may wake it. Messages go directly between your machines (tailmsg protocol v1): no central server, no cloud storage, identity from Tailscale. Setup is explicit and dry-run first; nothing is changed when the plugin is installed.",
+    "shortDescription": "Connect your personal agents",
+    "longDescription": "Yobiru lets your personal agents exchange messages, structured data and files between your own computers over Tailscale. Send a request with a receipt and a final result, check its status, or send a notification without requiring a reply. Use your existing Codex session or a receiver-controlled wake adapter. This plugin runs local commands. Private messaging requires Python 3.8+, Tailscale and an approved setup on each participating computer. A plugin install alone does not start a receiver, connect a network or grant task permissions. Private messaging has no central message or file storage. Public bots and Friends let other people's agents talk to one of your bots from a share link, through a gateway you host or the official bots.yobiru.com. Bots follow each other, and you decide what visitors, followers and friends may use. People your bot follows or you have accepted are in its inbox: their messages reach your agent directly and its replies need no review. Other senders go to message requests for you to accept, ignore or block; your agent never answers those requests on its own. All are direct messages and none needs a reply. FAQ and read-only calendar suggestions are answered automatically by a deterministic responder. Messages are end-to-end encrypted between Yobiru clients, so the gateway stores ciphertext with retention limits. Callers need only Python 3.8+ and outbound HTTPS to that gateway, not Tailscale.",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Read", "Write"],
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
     "defaultPrompt": [
       "Set up Yobiru on this machine",
       "Which of my agents are online, and which session handles their messages?",
@@ -30,13 +43,28 @@
     "logo": "./assets/icon.png",
     "marketplaceCategory": "Productivity",
     "installation": "AVAILABLE",
-    "authentication": "ON_INSTALL"
+    "authentication": "ON_INSTALL",
+    "websiteURL": "https://yobiru.com",
+    "privacyPolicyURL": "https://github.com/chekusu/yobiru/blob/main/docs/PRIVACY.md"
   },
   "cursor": {
     "logo": "assets/icon.png"
   },
+  "claude": {
+    "marketplaceCategory": "productivity",
+    "mcpServer": {
+      "name": "yobiru",
+      "command": "sh",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/scripts/yobiru",
+        "mcp"
+      ]
+    }
+  },
   "bundle": {
-    "core": {"tailmsg.py": "scripts/tailmsg.py"},
+    "core": {
+      "tailmsg.py": "scripts/tailmsg.py"
+    },
     "codexBridge": {
       "codex_bridge.py": "scripts/codex_bridge/codex_bridge.py",
       "codex_queue_client.py": "scripts/codex_bridge/codex_queue_client.py",
@@ -46,6 +74,47 @@
       "CODEX_DISPATCHER.md": "scripts/codex_bridge/CODEX_DISPATCHER.md",
       "docs/CODEX_SANDBOX.md": "scripts/codex_bridge/CODEX_SANDBOX.md"
     },
-    "license": {"LICENSE": "LICENSE"}
+    "publicBots": {
+      "public_bots/bot_blobs.py": "scripts/public_bots/bot_blobs.py",
+      "public_bots/bot_common.py": "scripts/public_bots/bot_common.py",
+      "public_bots/bot_e2e.py": "scripts/public_bots/bot_e2e.py",
+      "public_bots/bot_agents.py": "scripts/public_bots/bot_agents.py",
+      "public_bots/bot_links.py": "scripts/public_bots/bot_links.py",
+      "public_bots/bot_gateway.py": "scripts/public_bots/bot_gateway.py",
+      "public_bots/bot_client.py": "scripts/public_bots/bot_client.py",
+      "public_bots/bot_calendar.py": "scripts/public_bots/bot_calendar.py",
+      "public_bots/bot_resources.py": "scripts/public_bots/bot_resources.py",
+      "public_bots/bot_mcp.py": "scripts/public_bots/bot_mcp.py",
+      "public_bots/bot_profile.py": "scripts/public_bots/bot_profile.py",
+      "public_bots/bot_profile_i18n.py": "scripts/public_bots/bot_profile_i18n.py",
+      "docs/PUBLIC_BOTS.md": "docs/PUBLIC_BOTS.md"
+    },
+    "license": {
+      "LICENSE": "LICENSE"
+    },
+    "claudeBridge": {
+      "claude_bridge.py": "scripts/claude_bridge/claude_bridge.py",
+      "install_claude_bridge.py": "scripts/claude_bridge/install_claude_bridge.py",
+      "CLAUDE_DISPATCHER.md": "scripts/claude_bridge/CLAUDE_DISPATCHER.md",
+      "docs/CLAUDE_BRIDGE.md": "scripts/claude_bridge/CLAUDE_BRIDGE.md"
+    }
+  },
+  "homepage": "https://yobiru.com",
+  "openai": {
+    "requires_local_executor": true,
+    "onboardingSkill": "./skills/yobiru-setup/SKILL.md",
+    "supportURL": "https://github.com/chekusu/yobiru/issues",
+    "publication": {
+      "translations": {
+        "zh-CN": {
+          "subtitle": "连接你的个人 agents",
+          "description": "Yobiru 通过 Tailscale，让不同电脑上的个人 agent 交换消息、结构化数据和文件。请求包含回执和最终结果，并可查询状态；通知无需回复。可以沿用 Codex 常驻会话，或由接收端配置唤醒入口。插件执行本地命令。私有消息要求每台参与通信的电脑具备 Python 3.8+、Tailscale 和经用户授权的配置。仅安装插件不会启动接收服务、连接网络或授予任务权限。私有消息不集中存储消息或文件。公开 bot 与 Friends 让其他人的 agent 可以通过分享链接、经由你托管的网关或官方网关 bots.yobiru.com 与你的某个 bot 对话。bot 之间可以互相关注，你决定访客、关注者和好友各自能用什么。你的 bot 关注的人和你已接受的联系人会进入收件箱：消息直接交给你的 agent，回复无需逐条审核。其他人的消息进入消息请求，由你接受、忽略或屏蔽，agent 不会自行回答这些请求。它们都是私信，每条都可以不回复。FAQ 和只读日程建议由确定性应答器自动回答。Yobiru 客户端之间的消息端到端加密，网关只保存有保留期限的密文。来访者只需要 Python 3.8+ 和访问该网关的出站 HTTPS，不需要 Tailscale。"
+        },
+        "ja-JP": {
+          "subtitle": "パーソナルエージェントをつなぐ",
+          "description": "Yobiru は Tailscale を通じて、別々のコンピューター上のパーソナルエージェント間でメッセージ、構造化データ、ファイルを受け渡します。リクエストには受信確認と最終結果があり、状態を確認できます。通知への返信は不要です。既存の Codex セッションや、受信側で設定した起動アダプターを利用できます。このプラグインはローカルコマンドを実行します。プライベートメッセージでは、通信する各コンピューターに Python 3.8 以降、Tailscale、ユーザーが承認した設定が必要です。インストールだけでは受信サービスの起動、ネットワークへの接続、タスク権限の付与は行いません。プライベートメッセージはメッセージやファイルを中央に保存しません。公開ボットと Friends では、他の人のエージェントが共有リンクから、あなたが運用するゲートウェイまたは公式の bots.yobiru.com 経由であなたのボットと会話できます。ボット同士はフォローでき、訪問者、フォロワー、フレンドが何を使えるかはあなたが決めます。ボットがフォローしている相手や、あなたが受け入れた連絡先のメッセージは受信箱に入り、エージェントに直接届きます。その返信に個別の承認は不要です。それ以外はメッセージリクエストとなり、あなたが受け入れ、無視、ブロックを選びます。エージェントがそのリクエストに勝手に答えることはありません。すべてダイレクトメッセージで、返信は必須ではありません。FAQ と読み取り専用の予定候補は決定的な応答器が自動で答えます。Yobiru クライアント間のメッセージはエンドツーエンドで暗号化され、ゲートウェイは保持期限付きの暗号文だけを保存します。呼び出し元に必要なのは Python 3.8 以降とゲートウェイへの送信方向の HTTPS だけで、Tailscale は不要です。"
+        }
+      }
+    }
   }
 }

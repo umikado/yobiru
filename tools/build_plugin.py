@@ -21,6 +21,7 @@ import stat
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 PRODUCT_FILE = ROOT / "packaging" / "product.json"
@@ -55,7 +56,11 @@ PLUGIN_NAME_RE = re.compile(r"^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?
 CODEX_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\Z")
 MARKETPLACE_RE = re.compile(r"^[A-Za-z0-9_-]+\Z")
 SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*\Z")
-SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\Z")
+# SemVer 2.0, the grammar the launcher uses to compare an installation with releases: a prerelease such as
+# 0.6.0-beta.1 is a list of dot-separated identifiers, none empty, numeric ones without leading zeros.
+PRE_ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-" + PRE_ID + r"(?:\." + PRE_ID + r")*)?"
+                       r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\Z")
 CODEX_KEYS = {"id", "name", "version", "description", "skills", "apps", "mcpServers", "interface", "author",
               "homepage", "repository", "license", "keywords"}
 CODEX_INTERFACE_KEYS = {"displayName", "shortDescription", "longDescription", "developerName", "category",
@@ -63,8 +68,12 @@ CODEX_INTERFACE_KEYS = {"displayName", "shortDescription", "longDescription", "d
                         "composerIcon", "logo", "logoDark", "screenshots", "defaultPrompt", "default_prompt"}
 AGENT_PLUGIN_KEYS = {"$schema", "name", "version", "description", "author", "homepage", "repository", "license",
                      "keywords", "extensions"}
+OPENAI_KEYS = {"interface", "requires_local_executor", "onboardingSkill", "publication"}
+OPENAI_INTERFACE_KEYS = CODEX_INTERFACE_KEYS | {"supportURL"}
 CURSOR_KEYS = {"name", "description", "version", "author", "homepage", "repository", "license", "keywords", "logo",
                "rules", "agents", "skills", "commands", "hooks", "mcpServers", "variables"}
+CLAUDE_KEYS = {"name", "version", "description", "author", "homepage", "repository", "license", "keywords",
+               "mcpServers"}
 
 
 class BuildError(Exception):
@@ -107,9 +116,29 @@ def render(p):
                            "category": c["category"], "capabilities": c["capabilities"],
                            "defaultPrompt": c["defaultPrompt"], "brandColor": c["brandColor"],
                            "composerIcon": c["composerIcon"], "logo": c["logo"]}}
+    for key in ("websiteURL", "privacyPolicyURL"):
+        codex["interface"][key] = c[key]
+    # The portable OpenAI extension replaces (rather than merges with) the legacy
+    # overlay. Keep the complete interface in both; only the extension uses new
+    # directory fields so old Codex manifest validators remain compatible.
+    oa = p["openai"]
+    portable["extensions"] = {"com.openai": {
+        "interface": dict(codex["interface"], supportURL=oa["supportURL"]),
+        "requires_local_executor": oa["requires_local_executor"],
+        "onboardingSkill": oa["onboardingSkill"],
+        "publication": oa["publication"],
+    }}
     cursor = {"name": pid, "version": p["version"], "description": p["description"], "author": author,
               "repository": p["repository"], "license": p["license"], "keywords": p["keywords"],
               "logo": p["cursor"]["logo"]}
+    # Claude Code: default discovery finds skills/; the MCP server is declared here only, because Claude Code
+    # expands ${CLAUDE_PLUGIN_ROOT} and no other host reads this file (a shared mcp.json would reach Cursor).
+    cl = p["claude"]["mcpServer"]
+    claude = {"name": pid, "version": p["version"], "description": p["description"], "author": author,
+              "repository": p["repository"], "license": p["license"], "keywords": p["keywords"],
+              "mcpServers": {cl["name"]: {"command": cl["command"], "args": cl["args"]}}}
+    for manifest in (portable, codex, cursor, claude):
+        manifest["homepage"] = p["homepage"]
     m = p["marketplace"]
     codex_market = {"name": m["name"], "interface": {"displayName": m["displayName"]},
                     "plugins": [{"name": pid, "source": {"source": "local", "path": "./" + p["pluginDir"]},
@@ -119,12 +148,19 @@ def render(p):
     cursor_market = {"name": m["name"], "owner": {"name": p["publisher"]},
                      "metadata": {"description": m["description"], "version": p["version"]},
                      "plugins": [{"name": pid, "source": p["pluginDir"], "description": p["description"]}]}
+    claude_market = {"name": m["name"], "owner": {"name": p["publisher"]},
+                     "metadata": {"description": m["description"], "version": p["version"]},
+                     "plugins": [{"name": pid, "source": "./" + p["pluginDir"], "description": p["description"],
+                                  "version": p["version"], "category": p["claude"]["marketplaceCategory"],
+                                  "homepage": p["homepage"]}]}
     d = p["pluginDir"]
     out = {d + "/plugin.json": jbytes(portable), d + "/.codex-plugin/plugin.json": jbytes(codex),
-           d + "/.cursor-plugin/plugin.json": jbytes(cursor), ".agents/plugins/marketplace.json": jbytes(codex_market),
-           ".cursor-plugin/marketplace.json": jbytes(cursor_market)}
+           d + "/.cursor-plugin/plugin.json": jbytes(cursor), d + "/.claude-plugin/plugin.json": jbytes(claude),
+           ".agents/plugins/marketplace.json": jbytes(codex_market),
+           ".cursor-plugin/marketplace.json": jbytes(cursor_market),
+           ".claude-plugin/marketplace.json": jbytes(claude_market)}
     sources = {}
-    for group in ("core", "codexBridge", "license"):
+    for group in ("core", "codexBridge", "claudeBridge", "publicBots", "license"):
         for src, dst in sorted(p["bundle"][group].items()):
             data = (ROOT / src).read_bytes()
             out[d + "/" + dst] = data
@@ -142,7 +178,8 @@ def symlinks(p, root=ROOT):
     base = root / p["pluginDir"]
     found = [rel for rel in (p["pluginDir"], "plugins", ".agents", ".agents/plugins",
                              ".agents/plugins/marketplace.json", ".cursor-plugin",
-                             ".cursor-plugin/marketplace.json") if (root / rel).is_symlink()]
+                             ".cursor-plugin/marketplace.json", ".claude-plugin",
+                             ".claude-plugin/marketplace.json") if (root / rel).is_symlink()]
     if base.is_dir() and not base.is_symlink():
         for dirpath, dirnames, filenames in os.walk(str(base)):
             for name in dirnames + filenames:
@@ -205,6 +242,83 @@ def rel_inside(base, rel):
     return target == base.resolve() or str(target).startswith(str(base.resolve()) + os.sep)
 
 
+def public_https_url(value):
+    """A credential-free HTTPS listing URL; availability is checked before submission."""
+    if (not isinstance(value, str) or not value or len(value) > 1024 or
+            any(c.isspace() or ord(c) < 32 or 127 <= ord(c) <= 159 for c in value)):
+        return False
+    try:
+        parsed = urlsplit(value)
+        return (parsed.scheme == "https" and bool(parsed.hostname) and
+                parsed.username is None and parsed.password is None)
+    except ValueError:
+        return False
+
+
+def validate_openai(manifest, legacy_ui, base):
+    """Validate this skills-only submission's documented OpenAI fields.
+
+    https://developers.openai.com/plugins/deploy/submission
+    https://developers.openai.com/plugins/deploy/desktop-only
+    This is intentionally a check of the shape Yobiru ships, not a general
+    replacement for the portal's eligibility, policy and skill scans.
+    """
+    errs = []
+    extensions = manifest.get("extensions")
+    if not isinstance(extensions, dict) or set(extensions) != {"com.openai"}:
+        return ["plugin.json: extensions must contain the complete com.openai settings"]
+    oa = extensions["com.openai"]
+    if not isinstance(oa, dict) or set(oa) - OPENAI_KEYS:
+        return ["plugin.json: unsupported com.openai settings"]
+    if oa.get("requires_local_executor") is not True:
+        errs.append("plugin.json: com.openai.requires_local_executor must be true for local Tailscale commands")
+    ui = oa.get("interface")
+    if not isinstance(ui, dict):
+        errs.append("plugin.json: com.openai.interface must contain the full listing; the overlay is not merged")
+        ui = {}
+    if set(ui) - OPENAI_INTERFACE_KEYS:
+        errs.append("plugin.json: unsupported com.openai.interface fields")
+    for key, value in legacy_ui.items():
+        if key not in ui or ui[key] != value:
+            errs.append("plugin.json: com.openai.interface.%s must match the compatibility manifest" % key)
+    for key, limit in (("displayName", 30), ("shortDescription", 30),
+                       ("longDescription", 4000), ("developerName", 80)):
+        value = ui.get(key)
+        if not isinstance(value, str) or not value.strip() or len(value) > limit:
+            errs.append("plugin.json: com.openai.interface.%s must be 1-%d characters" % (key, limit))
+    for key in ("websiteURL", "supportURL", "privacyPolicyURL"):
+        if not public_https_url(ui.get(key)):
+            errs.append("plugin.json: com.openai.interface.%s must be a credential-free HTTPS URL" % key)
+    if "screenshots" in ui:
+        errs.append("plugin.json: skills-only directory submissions cannot include screenshots")
+    onboarding = oa.get("onboardingSkill")
+    if (not isinstance(onboarding, str) or not onboarding.startswith("./skills/") or
+            not onboarding.endswith("/SKILL.md") or not rel_inside(base, onboarding) or
+            not (base / onboarding).is_file()):
+        errs.append("plugin.json: com.openai.onboardingSkill must name an included skill")
+    publication = oa.get("publication")
+    if not isinstance(publication, dict) or set(publication) - {"translations"}:
+        errs.append("plugin.json: unsupported com.openai.publication settings")
+        return errs
+    translations = publication.get("translations")
+    if not isinstance(translations, dict) or not translations:
+        errs.append("plugin.json: publication.translations must be a nonempty locale map")
+        return errs
+    for locale, fields in translations.items():
+        if not isinstance(locale, str) or not re.match(r"^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*\Z", locale):
+            errs.append("plugin.json: invalid publication translation locale")
+        if not isinstance(fields, dict) or not fields or set(fields) - {"subtitle", "description"}:
+            errs.append("plugin.json: translation fields must be subtitle and/or description")
+            continue
+        for key, value in fields.items():
+            limit = 30 if key == "subtitle" else 4000
+            if (not isinstance(value, str) or not value.strip() or len(value) > limit or
+                    any((ord(c) < 32 or 127 <= ord(c) <= 159) and
+                        not (key == "description" and c == "\n") for c in value)):
+                errs.append("plugin.json: translated %s must contain supported text within %d characters" % (key, limit))
+    return errs
+
+
 def validate(p, root=ROOT):
     errs = []
     base = root / p["pluginDir"]
@@ -236,8 +350,6 @@ def validate(p, root=ROOT):
         errs.append("plugin.json: author must be {name, email, url} strings")
     if "keywords" in m and not (isinstance(m["keywords"], list) and all(isinstance(k, str) for k in m["keywords"])):
         errs.append("plugin.json: keywords must be strings")
-    if "extensions" in m:
-        errs.append("plugin.json: extensions would replace the .codex-plugin overlay; keep it out")
     # Codex compatibility manifest (rules of the plugin-creator validator)
     c = load(p["pluginDir"] + "/.codex-plugin/plugin.json")
     if set(c) - CODEX_KEYS:
@@ -246,6 +358,15 @@ def validate(p, root=ROOT):
         errs.append(".codex-plugin: name must be %s" % pid)
     if not SEMVER_RE.match(str(c.get("version"))):
         errs.append(".codex-plugin: version must be strict semver")
+    if not SEMVER_RE.match(str(p.get("version"))):
+        errs.append("packaging/product.json: version must be SemVer 2.0 (for example 0.6.0 or 0.6.0-beta.1)")
+    elif "-" in p["version"].split("+")[0]:
+        # A prerelease ships from its own tag while the default branch keeps the stable release, so its listing
+        # must link the privacy notice of what it ships, not of the stable branch.
+        pinned = "%s/blob/v%s/" % (p["repository"], p["version"])
+        if not str(p["codex"].get("privacyPolicyURL")).startswith(pinned):
+            errs.append("packaging/product.json: a prerelease's codex.privacyPolicyURL must point into its own tag "
+                        "(%s...)" % pinned)
     if c.get("skills") != "./skills/":
         errs.append(".codex-plugin: skills must be ./skills/")
     if not isinstance(c.get("author"), dict) or not c["author"].get("name"):
@@ -267,6 +388,7 @@ def validate(p, root=ROOT):
         rel = str(ui.get(k, ""))
         if not rel.startswith("./") or not rel_inside(base, rel[2:]) or not (base / rel[2:]).is_file():
             errs.append(".codex-plugin: interface.%s must name a file inside the plugin" % k)
+    errs.extend(validate_openai(m, ui, base))
     # Cursor native manifest
     cu = load(p["pluginDir"] + "/.cursor-plugin/plugin.json")
     if set(cu) - CURSOR_KEYS:
@@ -281,11 +403,35 @@ def validate(p, root=ROOT):
         if k in cu:
             errs.append(".cursor-plugin: %s would replace default discovery; keep it out" % k)
     if (base / "mcp.json").exists() or (base / ".mcp.json").exists() or (base / "hooks").exists():
-        errs.append("plugin: no MCP config or hooks are shipped in this release")
-    for man, label in ((m, "plugin.json"), (cu, ".cursor-plugin")):
-        for k in ("version", "description", "repository", "license", "keywords"):
+        errs.append("plugin: no shared MCP config or hooks are shipped; Claude Code's server lives in .claude-plugin")
+    # Claude Code native manifest: skills by default discovery, one stdio MCP server running the bundled launcher
+    cc = load(p["pluginDir"] + "/.claude-plugin/plugin.json")
+    if set(cc) - CLAUDE_KEYS:
+        errs.append(".claude-plugin: unsupported fields %s" % sorted(set(cc) - CLAUDE_KEYS))
+    if cc.get("name") != pid:
+        errs.append(".claude-plugin: name must be %s" % pid)
+    if not isinstance(cc.get("author"), dict) or set(cc["author"]) - {"name", "email", "url"} or \
+            not cc["author"].get("name"):
+        errs.append(".claude-plugin: author must be {name[, email, url]}")
+    servers = cc.get("mcpServers")
+    if not isinstance(servers, dict) or len(servers) != 1:
+        errs.append(".claude-plugin: exactly one MCP server expected")
+    else:
+        (sname, server), = servers.items()
+        args = server.get("args") if isinstance(server, dict) else None
+        launcher = "${CLAUDE_PLUGIN_ROOT}/scripts/" + pid
+        if (set(server) != {"command", "args"} or server.get("command") != "sh" or not isinstance(args, list) or
+                args[:1] != [launcher] or args[1:2] != ["mcp"] or
+                any(not isinstance(x, str) or "$" in x for x in args[1:])):
+            errs.append(".claude-plugin: mcpServers.%s must run `sh %s mcp ...`" % (sname, launcher))
+        if not (base / "scripts" / pid).is_file() or not (base / "scripts" / (pid + "_mcp.py")).is_file():
+            errs.append(".claude-plugin: the MCP server's launcher or scripts/%s_mcp.py is missing" % pid)
+    for man, label in ((m, "plugin.json"), (cu, ".cursor-plugin"), (cc, ".claude-plugin")):
+        for k in ("version", "description", "homepage", "repository", "license", "keywords"):
             if man.get(k) != c.get(k):
                 errs.append("%s: %s differs from .codex-plugin" % (label, k))
+    if not public_https_url(m.get("homepage")):
+        errs.append("plugin.json: homepage must be a credential-free HTTPS URL")
     # catalogs
     cm = load(".agents/plugins/marketplace.json")
     if not MARKETPLACE_RE.match(str(cm.get("name"))):
@@ -310,6 +456,15 @@ def validate(p, root=ROOT):
         errs.append(".cursor-plugin marketplace: one %s entry whose source holds .cursor-plugin/plugin.json" % pid)
     if len(jbytes(km)) > 10 * 1024 * 1024:
         errs.append(".cursor-plugin marketplace: larger than 10 MB")
+    clm = load(".claude-plugin/marketplace.json")
+    if not PLUGIN_NAME_RE.match(str(clm.get("name"))) or not (clm.get("owner") or {}).get("name"):
+        errs.append(".claude-plugin marketplace: name (kebab-case) and owner.name required")
+    centries = [e for e in clm.get("plugins", []) if isinstance(e, dict) and e.get("name") == pid]
+    if len(centries) != 1 or centries[0].get("source") != "./" + p["pluginDir"] or \
+            not (root / p["pluginDir"] / ".claude-plugin" / "plugin.json").is_file() or \
+            centries[0].get("version") != c.get("version"):
+        errs.append(".claude-plugin marketplace: one %s entry, source ./%s holding .claude-plugin/plugin.json, "
+                    "same version" % (pid, p["pluginDir"]))
     # skills
     skills = sorted(x for x in (base / "skills").iterdir() if x.is_dir()) if (base / "skills").is_dir() else []
     if not skills:
@@ -411,7 +566,8 @@ def archives(p, root=ROOT):
     plugin_zip = zip_bytes([("%s/%s" % (pid, rel), data, exe) for rel, data, exe in files])
     mroot = "%s-marketplace" % pid
     market = [("%s/%s/%s" % (mroot, p["pluginDir"], rel), data, exe) for rel, data, exe in files]
-    for rel in (".agents/plugins/marketplace.json", ".cursor-plugin/marketplace.json", "LICENSE"):
+    for rel in (".agents/plugins/marketplace.json", ".cursor-plugin/marketplace.json", ".claude-plugin/marketplace.json",
+                "LICENSE"):
         market.append(("%s/%s" % (mroot, rel), (root / rel).read_bytes(), False))
     market_zip = zip_bytes(sorted(market))
     return {"%s-%s-plugin.zip" % (pid, ver): plugin_zip, "%s-%s-marketplace.zip" % (pid, ver): market_zip}

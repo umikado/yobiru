@@ -15,6 +15,14 @@ REPO = Path(__file__).resolve().parents[2]
 SUPPORT = Path(__file__).resolve().parent
 
 
+def python_env(values):
+    """Keep isolated test settings and the selected Linux interpreter's loader path."""
+    env = dict(values)
+    if sys.platform.startswith("linux") and os.environ.get("LD_LIBRARY_PATH"):
+        env.setdefault("LD_LIBRARY_PATH", os.environ["LD_LIBRARY_PATH"])
+    return env
+
+
 def load_builder():
     spec = importlib.util.spec_from_file_location("build_plugin", str(REPO / "tools" / "build_plugin.py"))
     mod = importlib.util.module_from_spec(spec)
@@ -30,14 +38,25 @@ def free_port():
     return port
 
 
-def snapshot(path):
-    """{relative path: sha256 or 'dir'} for everything under path (missing path -> None)."""
+def snapshot(path, ignore_macos_caches=False):
+    """{relative path: sha256 or 'dir'} under path (missing path -> None).
+
+    Fake HOME snapshots may ignore macOS framework caches created by Python
+    itself. Keep other Library entries and all package snapshots visible.
+    """
     path = Path(path)
     if not path.exists():
         return None
     out = {}
     for p in sorted(path.rglob("*")):
         rel = p.relative_to(path).as_posix()
+        if ignore_macos_caches and sys.platform == "darwin":
+            # The Library directory is scaffolding; only its Caches subtree is
+            # runtime noise. Files or symlinks at either name remain visible.
+            if rel in ("Library", "Library/Caches") and p.is_dir() and not p.is_symlink():
+                continue
+            if rel.startswith("Library/Caches/"):
+                continue
         out[rel] = "dir" if p.is_dir() else hashlib.sha256(p.read_bytes()).hexdigest()
     return out
 
@@ -85,7 +104,7 @@ class Package(object):
 
     def env(self, user_home, tailscale=False, extra=None):
         path = str(self.bin) + (os.pathsep + str(self.fakebin) if tailscale else "")
-        e = {"HOME": str(user_home), "PATH": path, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+        e = python_env({"HOME": str(user_home), "PATH": path, "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
         e.update(extra or {})
         return e
 

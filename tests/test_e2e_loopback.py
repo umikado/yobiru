@@ -28,7 +28,7 @@ printf '%%s %%s %%s\\n' "$TAILMSG_AGENT" "$TAILMSG_MSG_ID" "$#" >> '%s'
 
 def node(name, peer):
     return {"BackendState": "Running",
-            "Self": {"DNSName": "%s.example.ts.net." % name, "HostName": name, "TailscaleIPs": ["127.0.0.1"],
+            "Self": {"ID": name + "-stable", "DNSName": "%s.example.ts.net." % name, "HostName": name, "TailscaleIPs": ["127.0.0.1"],
                      "Online": True},
             "Peer": {"p1": {"DNSName": "%s.example.ts.net." % peer, "HostName": peer, "OS": "linux",
                             "TailscaleIPs": ["127.0.0.1"], "Online": True}}}
@@ -208,7 +208,10 @@ class LoopbackWorkflowTests(unittest.TestCase):
         self.assertEqual("ok", checks["receiver"]["status"], checks["receiver"])
         self.assertIn("bravo.example.ts.net", checks["receiver"]["detail"])
         self.assertEqual("ok", checks["wake @codex"]["status"])
+        self.assertIn(checks["maintenance"]["status"], ("ok", "info"), checks["maintenance"])   # healthy or starting
         st = self.tm_json("bravo", "status", "--json")
+        self.assertIn(st["receiver"]["status"], ("healthy", "starting"))
+        self.assertTrue(st["receiver"]["maintenance"]["supported"])
         self.assertEqual(["codex", "helper"], [a["agent"] for a in st["agents"]])
         self.assertTrue(st["receiver"]["ok"])
 
